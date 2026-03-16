@@ -27,6 +27,7 @@ authentication is handled, and how the entire execution pipeline fits together.
     - [AgentTool — Wrapping Sub-Agents as Callable Tools](#agenttool--wrapping-sub-agents-as-callable-tools)
 12. [Retrieval Tools](#12-retrieval-tools)
 13. [Utility Tools](#13-utility-tools)
+    - [LoadMemoryTool — Cross-Session Memory Search](#loadmemorytool--cross-session-memory-search)
 14. [Authentication System](#14-authentication-system)
 15. [Tool Execution Flow (Runner → Agent → Tool)](#15-tool-execution-flow-runner--agent--tool)
 16. [ToolContext — What Tools Receive at Runtime](#16-toolcontext--what-tools-receive-at-runtime)
@@ -1356,21 +1357,227 @@ class BaseRetrievalTool(BaseTool):
 
 ## 13. Utility Tools
 
-### LoadMemoryTool — Session Memory Search
+### LoadMemoryTool — Cross-Session Memory Search
+
+`LoadMemoryTool` gives an agent the ability to recall information from **past
+sessions** with the same user. Unlike session history (which is automatically
+available within a single conversation), memory is a **cross-session recall
+system** that the LLM explicitly queries when it needs to remember something
+from a previous interaction.
+
+#### Memory Scope
+
+Memory is scoped **per-user-per-app** — not per-session, not per-organization.
+
+```python
+# src/google/adk/memory/base_memory_service.py
+
+async def search_memory(
+    self,
+    *,
+    app_name: str,    # App-level isolation
+    user_id: str,     # User-level isolation
+    query: str,       # Semantic search query
+) -> SearchMemoryResponse:
+```
+
+- **Per-user:** Memory from user A is never visible to user B.
+- **Per-app:** Memory stored under app X is not visible to app Y.
+- **Cross-session:** Memory spans all sessions for a given (app, user) pair —
+  the whole point is recalling facts from previous conversations.
+- **Session-tagged:** Events are optionally tagged with `session_id` during
+  ingestion so backends can track provenance, but search always returns results
+  across all sessions.
+
+#### Memory vs. Session History
+
+Memory and session history are **separate systems** with different scopes and
+purposes:
+
+| Aspect | Session History | Memory |
+|--------|----------------|--------|
+| **Scope** | Single session | All sessions for a user |
+| **Content** | All events (messages, function calls, state) | Filtered events (text content only) |
+| **Written** | Automatically by Runner | Manually via `add_session_to_memory()` |
+| **Read** | Loaded from `SessionService` on each turn | Searched via `LoadMemoryTool` or `PreloadMemoryTool` |
+| **Query** | By `session_id` | By semantic/keyword query |
+| **Purpose** | Conversation context for current session | Recall past interactions across sessions |
+| **Storage** | SessionService (in-memory, Spanner, Vertex AI) | MemoryService (in-memory, RAG, Memory Bank) |
+
+#### How LoadMemoryTool Works
 
 ```python
 # src/google/adk/tools/load_memory_tool.py
 
 class LoadMemoryTool(FunctionTool):
-    async def process_llm_request(self, *, tool_context, llm_request):
-        """Add memory instruction to system prompt."""
-        llm_request.config.system_instruction += MEMORY_INSTRUCTION
+    """Tool that lets the LLM search memory on demand."""
 
-async def load_memory(query: str, tool_context: ToolContext) -> LoadMemoryResponse:
-    """Search session memory for relevant past interactions."""
-    results = await tool_context.search_memory(query)
-    return LoadMemoryResponse(memories=results)
+    async def process_llm_request(self, *, tool_context, llm_request):
+        """Inject instructions telling the LLM it has memory."""
+        llm_request.append_instructions([
+            "You have memory. You can use it to answer questions. "
+            "If any questions need you to look up the memory, you "
+            "should call load_memory function with a query."
+        ])
+
+# The underlying function:
+async def load_memory(
+    query: str, tool_context: ToolContext
+) -> LoadMemoryResponse:
+    """Loads memory for the current user."""
+    search_memory_response = await tool_context.search_memory(query)
+    return LoadMemoryResponse(memories=search_memory_response.memories)
+
+class LoadMemoryResponse(BaseModel):
+    memories: list[MemoryEntry] = Field(default_factory=list)
 ```
+
+The `process_llm_request` hook injects a system instruction on every LLM call
+so the model knows it can recall past interactions. When the LLM decides to
+call `load_memory(query="...")`, the tool delegates to
+`tool_context.search_memory()` which calls the configured memory service with
+the current `app_name` and `user_id` automatically.
+
+#### Memory Lifecycle
+
+```
+Session 1 (January):
+  User: "My favorite language is Python"
+  Agent: "Great choice!"
+  → Events stored in SessionService automatically
+
+Explicit memory update (manual trigger):
+  add_session_to_memory(session)
+  → Memory service filters events (removes function calls, empty events)
+  → Stores text content indexed by (app_name, user_id)
+
+Session 2 (March):
+  User: "What programming language do I prefer?"
+  → LLM sees "You have memory" in system instruction
+  → LLM calls: load_memory(query="favorite programming language")
+  → MemoryService.search_memory(app_name=..., user_id=..., query=...)
+  → Returns: MemoryEntry(content="My favorite language is Python", author="user")
+  → LLM: "You mentioned that Python is your favorite language!"
+```
+
+**Key design choice:** Memory writes are **not automatic**. Unlike session
+history (which the Runner appends to after every turn), memory must be
+explicitly populated via one of:
+
+1. **`add_session_to_memory(session)`** — Ingests all events from a session.
+2. **`add_events_to_memory(events)`** — Ingests a specific subset of events
+   (e.g., just the latest turn).
+3. **CLI endpoint** — `POST /update_memory` in the ADK web server.
+4. **Agent callbacks** — Custom code that calls `ctx.add_session_to_memory()`.
+
+#### Storage Backends
+
+ADK provides three memory service implementations:
+
+**1. `InMemoryMemoryService`** — Development/testing only.
+
+```python
+# Stores events in a Python dict keyed by "{app_name}/{user_id}"
+# Search: case-insensitive keyword matching (extracts words via regex)
+
+memory_service = InMemoryMemoryService()
+```
+
+Search mechanism is simple word overlap — if any word from the query appears
+in an event's text, it's returned:
+
+```python
+# Simplified from in_memory_memory_service.py
+words_in_query = _extract_words_lower(query)   # {"python", "favorite"}
+words_in_event = _extract_words_lower(event_text)  # {"my", "favorite", "language", "is", "python"}
+
+if any(word in words_in_event for word in words_in_query):
+    # Match — return this event
+```
+
+**2. `VertexAiRagMemoryService`** — Semantic search via Vertex AI RAG.
+
+```python
+# Stores events as JSON lines uploaded to a Vertex AI RAG corpus.
+# Search: vector embedding similarity (semantic, not keyword).
+
+memory_service = VertexAiRagMemoryService(
+    rag_corpus="projects/{proj}/locations/{loc}/ragCorpora/{id}",
+    similarity_top_k=10,          # Max results
+    vector_distance_threshold=10,  # Similarity cutoff
+)
+```
+
+Events are serialized as JSON lines (`{"author": "user", "timestamp": ...,
+"text": "..."}`) and uploaded as files with display names encoding
+`{app_name}.{user_id}.{session_id}`. Search uses Vertex AI's embedding-based
+retrieval, returning semantically similar content even if exact keywords don't
+match.
+
+**3. `VertexAiMemoryBankService`** — AI-powered memory extraction.
+
+```python
+# Uses Vertex AI Agent Engine to extract and store facts from conversations.
+# Search: server-side similarity search over extracted facts.
+
+memory_service = VertexAiMemoryBankService(
+    project="my-gcp-project",
+    location="us-central1",
+    agent_engine_id="my-reasoning-engine-id",
+)
+```
+
+Unlike the other backends, Memory Bank uses an LLM to **extract structured
+facts** from conversation events (e.g., "User prefers Python" from "My
+favorite language is Python"). Supports TTL/expiration, metadata propagation,
+and versioning.
+
+| Feature | InMemory | Vertex AI RAG | Vertex AI Memory Bank |
+|---------|----------|---------------|----------------------|
+| **Use case** | Testing | Semantic search | AI-powered extraction |
+| **Search** | Keyword overlap | Vector embeddings | LLM-extracted facts |
+| **Persistence** | RAM only | Cloud RAG corpus | Vertex AI Memory Bank |
+| **Cost** | Free | GCP API charges | GCP API charges |
+| **TTL support** | No | No | Yes |
+
+#### Wiring Memory into an Agent
+
+```python
+from google.adk.agents import Agent
+from google.adk.runners import Runner
+from google.adk.tools.load_memory_tool import LoadMemoryTool
+from google.adk.memory.in_memory_memory_service import InMemoryMemoryService
+from google.adk.sessions.in_memory_session_service import InMemorySessionService
+
+agent = Agent(
+    name="assistant",
+    model="gemini-2.5-flash",
+    instruction="You are a helpful assistant with memory of past conversations.",
+    tools=[LoadMemoryTool()],   # Gives the LLM the ability to search memory
+)
+
+runner = Runner(
+    app_name="my_app",
+    agent=agent,
+    session_service=InMemorySessionService(),
+    memory_service=InMemoryMemoryService(),  # Or VertexAiRagMemoryService(...)
+)
+
+# After a session ends, persist it to memory:
+session = await runner.session_service.get_session(
+    app_name="my_app", user_id="user123", session_id="session-abc"
+)
+await runner.memory_service.add_session_to_memory(session)
+
+# In the next session, LoadMemoryTool will find these memories when the LLM
+# searches for relevant context.
+```
+
+> **Note:** There is also `PreloadMemoryTool` which automatically searches
+> memory using the user's first message and injects results into the LLM
+> request before the model runs — no explicit tool call needed. Use
+> `LoadMemoryTool` when you want the LLM to decide when to search; use
+> `PreloadMemoryTool` when you always want memory context available.
 
 ### LoadArtifactsTool — Artifact Loading
 
