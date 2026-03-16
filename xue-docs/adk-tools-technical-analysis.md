@@ -21,6 +21,10 @@ authentication is handled, and how the entire execution pipeline fits together.
 9. [Database Tools (BigQuery, Bigtable, Spanner, Pub/Sub)](#9-database-tools-bigquery-bigtable-spanner-pubsub)
 10. [Third-Party Adapters (LangChain, CrewAI)](#10-third-party-adapters-langchain-crewai)
 11. [Skill Toolset](#11-skill-toolset)
+    - [Using SkillToolset in an Agent](#using-skilltoolset-in-an-agent)
+    - [Runtime Invocation Flow](#runtime-invocation-flow)
+    - [Skills vs. AgentTool](#skills-vs-agenttool-sub-agents-as-tools)
+    - [AgentTool — Wrapping Sub-Agents as Callable Tools](#agenttool--wrapping-sub-agents-as-callable-tools)
 12. [Retrieval Tools](#12-retrieval-tools)
 13. [Utility Tools](#13-utility-tools)
 14. [Authentication System](#14-authentication-system)
@@ -871,48 +875,449 @@ class CrewaiTool(FunctionTool):
 ## 11. Skill Toolset
 
 Skills are structured instruction folders that extend an agent's capabilities.
-The `SkillToolset` provides three sub-tools for skill management:
+Unlike other tool types that execute code, skills are **dynamic prompt
+injection** — they load curated instructions and resources into the LLM's
+context at runtime so the agent can follow specialized workflows.
+
+> **Important distinction:** Skills are **not** MCP servers, API endpoints, or
+> executable code. They are local folders of markdown instructions and resources
+> that are dynamically loaded into the LLM context. The LLM then follows those
+> instructions using its existing tools.
+
+### Skill Data Model
+
+A skill has three layers of content, loaded progressively:
+
+```python
+# src/google/adk/skills/models.py
+
+class Skill(BaseModel):
+    frontmatter: Frontmatter   # L1: Metadata for discovery (always loaded)
+    instructions: str          # L2: Main instructions from SKILL.md body
+    resources: Resources       # L3: Additional files loaded on demand
+
+class Frontmatter(BaseModel):
+    name: str                  # Skill name in kebab-case (required)
+    description: str           # What the skill does (required)
+    license: Optional[str]     # License information
+    compatibility: Optional[str]
+    allowed_tools: Optional[str]  # Tool patterns the skill requires
+    metadata: dict[str, str] = {}
+
+class Resources(BaseModel):
+    references: dict[str, str] = {}   # Additional markdown documentation
+    assets: dict[str, str] = {}       # Templates, schemas, examples
+    scripts: dict[str, Script] = {}   # Executable scripts
+```
+
+### Skill Folder Structure
+
+```
+my-code-review-skill/
+├── SKILL.md              # Required — frontmatter + instructions
+├── references/           # Optional — extra docs loaded via load_skill_resource
+│   ├── style-guide.md
+│   └── review-checklist.md
+├── assets/               # Optional — templates, schemas, examples
+│   ├── pr-template.md
+│   └── severity-scale.json
+└── scripts/              # Optional — executable scripts
+    └── run-linter.sh
+```
+
+### SKILL.md Format
+
+The `SKILL.md` file uses YAML frontmatter followed by markdown instructions:
+
+```markdown
+---
+name: code-review
+description: >
+  Performs structured code reviews following team standards.
+  Use this skill when the user asks for a code review,
+  PR review, or feedback on code quality.
+license: Apache-2.0
+compatibility: "gemini-2.5-flash, gemini-2.5-pro"
+allowed_tools: "google_search, load_skill_resource"
+metadata:
+  author: "platform-team"
+  version: "1.2.0"
+---
+
+# Code Review Skill
+
+## Steps
+
+1. First, ask the user to provide the code or PR diff.
+2. Load the style guide: use `load_skill_resource` with
+   path `references/style-guide.md`.
+3. Review the code against each item in the checklist at
+   `references/review-checklist.md`.
+4. Rate each finding using the severity scale at
+   `assets/severity-scale.json`.
+5. Format your response using the template at
+   `assets/pr-template.md`.
+```
+
+### Loading Skills from Disk
+
+ADK provides `load_skill_from_dir()` to parse skill directories:
+
+```python
+# src/google/adk/skills/utils.py
+
+def load_skill_from_dir(skill_dir: Union[str, pathlib.Path]) -> models.Skill:
+    """Load a complete skill from a directory."""
+    skill_dir = pathlib.Path(skill_dir).resolve()
+
+    # 1. Find and parse SKILL.md (or skill.md)
+    content = skill_md.read_text(encoding="utf-8")
+    parts = content.split("---", 2)       # Split frontmatter from body
+    frontmatter = models.Frontmatter(**yaml.safe_load(parts[1]))
+    body = parts[2].strip()
+
+    # 2. Recursively load all files from subdirectories
+    references = _load_dir(skill_dir / "references")
+    assets = _load_dir(skill_dir / "assets")
+    scripts = {
+        name: models.Script(src=content)
+        for name, content in _load_dir(skill_dir / "scripts").items()
+    }
+
+    return models.Skill(
+        frontmatter=frontmatter,
+        instructions=body,
+        resources=models.Resources(
+            references=references, assets=assets, scripts=scripts
+        ),
+    )
+```
+
+### Using SkillToolset in an Agent
+
+Here's a complete example of building an agent with skills:
+
+```python
+from google.adk.agents import Agent
+from google.adk.skills.utils import load_skill_from_dir
+from google.adk.tools.skill_toolset import SkillToolset
+
+# 1. Load skills from disk
+code_review_skill = load_skill_from_dir("./skills/code-review")
+testing_skill = load_skill_from_dir("./skills/testing-strategy")
+
+# 2. Create the toolset
+skill_toolset = SkillToolset(skills=[code_review_skill, testing_skill])
+
+# 3. Attach to an agent (alongside other tools)
+agent = Agent(
+    name="engineering_assistant",
+    model="gemini-2.5-flash",
+    instruction="You are a senior engineering assistant.",
+    tools=[
+        skill_toolset,           # Skills for specialized workflows
+        google_search,           # Regular tool for web search
+    ],
+)
+```
+
+### SkillToolset Internals
+
+The `SkillToolset` exposes **three tools** to the LLM and injects a system
+instruction that teaches the LLM how to use them:
 
 ```python
 # src/google/adk/tools/skill_toolset.py
 
 class SkillToolset(BaseToolset):
-    """Manages skill discovery and loading."""
-
     def __init__(self, skills: list[models.Skill]):
-        self._skills = skills
-
-    async def get_tools(self, readonly_context=None) -> list[BaseTool]:
-        return [
-            ListSkillsTool(self),     # Lists all available skills
-            LoadSkillTool(self),      # Loads a specific skill's instructions
-            LoadSkillResourceTool(self),  # Loads files within a skill folder
+        self._skills = {skill.name: skill for skill in skills}
+        self._tools = [
+            ListSkillsTool(self),           # list_skills()
+            LoadSkillTool(self),            # load_skill(name=...)
+            LoadSkillResourceTool(self),    # load_skill_resource(skill_name=..., path=...)
         ]
 
+    async def get_tools(self, readonly_context=None) -> list[BaseTool]:
+        return self._tools
+
     async def process_llm_request(self, *, tool_context, llm_request):
-        """Inject skill system instructions into LLM request."""
-        llm_request.config.system_instruction += DEFAULT_SKILL_SYSTEM_INSTRUCTION
+        """Inject skill catalog and system instruction into LLM request."""
+        skill_frontmatters = self._list_skills()
+        skills_xml = prompt.format_skills_as_xml(skill_frontmatters)
+        llm_request.append_instructions([skills_xml])
 ```
 
-**Skill folder structure:**
+The `process_llm_request` hook runs **before** the LLM call. It appends an XML
+catalog of available skills to the system instruction:
+
+```xml
+<available_skills>
+<skill>
+<name>code-review</name>
+<description>Performs structured code reviews following team standards.</description>
+</skill>
+<skill>
+<name>testing-strategy</name>
+<description>Designs test plans for new features.</description>
+</skill>
+</available_skills>
+```
+
+The injected system instruction tells the LLM:
+
+> _"You can use specialized 'skills' to help you with complex tasks. You MUST
+> use the skill tools to interact with these skills. If a skill seems relevant
+> to the current user query, you MUST use the `load_skill` tool with
+> `name="<SKILL_NAME>"` to read its full instructions before proceeding. Once
+> you have read the instructions, follow them exactly as documented."_
+
+### The Three Skill Tools
+
+**`list_skills()`** — No parameters. Returns the XML catalog of all available
+skills with their names and descriptions.
+
+```python
+class ListSkillsTool(BaseTool):
+    # FunctionDeclaration: no parameters
+    async def run_async(self, *, args, tool_context):
+        skill_frontmatters = self._toolset._list_skills()
+        return prompt.format_skills_as_xml(skill_frontmatters)
+```
+
+**`load_skill(name)`** — Takes a skill name, returns the full SKILL.md
+instructions and frontmatter metadata.
+
+```python
+class LoadSkillTool(BaseTool):
+    # FunctionDeclaration: required parameter "name" (string)
+    async def run_async(self, *, args, tool_context):
+        skill = self._toolset._get_skill(args["name"])
+        return {
+            "skill_name": skill_name,
+            "instructions": skill.instructions,    # Full SKILL.md body
+            "frontmatter": skill.frontmatter.model_dump(),
+        }
+```
+
+**`load_skill_resource(skill_name, path)`** — Loads a specific file from within
+a skill's `references/` or `assets/` directories.
+
+```python
+class LoadSkillResourceTool(BaseTool):
+    # FunctionDeclaration: required "skill_name" + "path"
+    async def run_async(self, *, args, tool_context):
+        skill = self._toolset._get_skill(args["skill_name"])
+        resource_path = args["path"]
+
+        if resource_path.startswith("references/"):
+            content = skill.resources.get_reference(
+                resource_path[len("references/"):]
+            )
+        elif resource_path.startswith("assets/"):
+            content = skill.resources.get_asset(
+                resource_path[len("assets/"):]
+            )
+
+        return {"skill_name": skill_name, "path": resource_path, "content": content}
+```
+
+### Runtime Invocation Flow
+
+Here's the complete sequence of what happens when a user asks a question that
+matches a skill:
 
 ```
-my_skill/
-├── SKILL.md           # Main instructions with metadata
-├── references/        # Documentation / examples
-└── assets/            # Templates, scripts, resources
+User: "Can you review this PR diff for me?"
+
+┌──────────────────────────────────────────────────────────────────────┐
+│ STEP 1: LLM Request Preparation                                     │
+│──────────────────────────────────────────────────────────────────────│
+│ SkillToolset.process_llm_request() runs before the LLM call:        │
+│                                                                      │
+│ System instruction now includes:                                     │
+│  • Original agent instruction                                       │
+│  • Skill system prompt ("You can use specialized skills...")         │
+│  • XML catalog of available skills                                   │
+│                                                                      │
+│ Function declarations added:                                         │
+│  • list_skills()                                                     │
+│  • load_skill(name: string)                                          │
+│  • load_skill_resource(skill_name: string, path: string)             │
+└──────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌──────────────────────────────────────────────────────────────────────┐
+│ STEP 2: LLM Decides to Load Skill                                   │
+│──────────────────────────────────────────────────────────────────────│
+│ The LLM sees "code-review" in the skill catalog and recognizes      │
+│ the user's request matches. It calls:                                │
+│                                                                      │
+│   load_skill(name="code-review")                                     │
+│                                                                      │
+│ Returns:                                                             │
+│   {                                                                  │
+│     "skill_name": "code-review",                                     │
+│     "instructions": "# Code Review Skill\n\n## Steps\n1. First...", │
+│     "frontmatter": {"name": "code-review", "description": "...",     │
+│                      "allowed_tools": "google_search, ..."}          │
+│   }                                                                  │
+└──────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌──────────────────────────────────────────────────────────────────────┐
+│ STEP 3: LLM Follows Skill Instructions                               │
+│──────────────────────────────────────────────────────────────────────│
+│ The skill instructions say to load the style guide, so LLM calls:   │
+│                                                                      │
+│   load_skill_resource(                                               │
+│     skill_name="code-review",                                        │
+│     path="references/style-guide.md"                                 │
+│   )                                                                  │
+│                                                                      │
+│ Returns: {"content": "# Style Guide\n\n## Naming conventions..."}   │
+│                                                                      │
+│ The LLM also loads the review checklist and severity scale as       │
+│ instructed by the skill.                                             │
+└──────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌──────────────────────────────────────────────────────────────────────┐
+│ STEP 4: LLM Produces Final Response                                  │
+│──────────────────────────────────────────────────────────────────────│
+│ With the skill instructions, style guide, checklist, and severity   │
+│ scale all loaded into context, the LLM performs the code review     │
+│ following the exact workflow defined in the skill.                   │
+│                                                                      │
+│ The response follows the template from assets/pr-template.md.       │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-**How skills work at runtime:**
+### Skills vs. AgentTool (Sub-Agents as Tools)
 
-1. Agent receives the skill system instruction telling it skills are available.
-2. Agent calls `list_skills` to see what's available.
-3. Agent calls `load_skill(name="my_skill")` to read `SKILL.md`.
-4. Agent follows the instructions from the skill.
-5. If needed, agent calls `load_skill_resource(name="my_skill", path="assets/template.txt")`.
+Skills and `AgentTool` solve different problems:
 
-Skills are **not** MCP servers. They are local folders of markdown instructions
-and resources that are dynamically loaded into the LLM context.
+| Aspect | SkillToolset | AgentTool |
+|--------|-------------|-----------|
+| **What it wraps** | Markdown instructions + resources | A full `Agent` instance |
+| **Execution** | LLM reads instructions and follows them | Spawns an isolated Runner for the sub-agent |
+| **State** | Shares the same LLM context window | Sub-agent gets a copy of parent state |
+| **Tools** | Uses the parent agent's existing tools | Sub-agent has its own tool set |
+| **Use case** | Structured workflows, templates, checklists | Delegating to a specialist agent with different model/tools |
+
+`AgentTool` is covered in detail in the next section.
+
+### AgentTool — Wrapping Sub-Agents as Callable Tools
+
+While skills inject instructions into the current agent's context, `AgentTool`
+takes a fundamentally different approach: it wraps an entire agent as a
+callable function that the parent LLM can invoke.
+
+```python
+# src/google/adk/tools/agent_tool.py
+
+class AgentTool(BaseTool):
+    """Wraps an agent as a callable tool."""
+
+    def __init__(self, agent, skip_summarization=False, *, include_plugins=True):
+        self.agent = agent
+        self.skip_summarization = skip_summarization
+        self.include_plugins = include_plugins
+        super().__init__(name=agent.name, description=agent.description)
+```
+
+**Example: Agent with a specialist sub-agent as a tool:**
+
+```python
+from google.adk.agents import Agent
+from google.adk.tools.agent_tool import AgentTool
+
+# Define a specialist sub-agent
+sql_expert = Agent(
+    name="sql_expert",
+    model="gemini-2.5-flash",
+    description="Writes and optimizes SQL queries. Call this when the user "
+                "needs help with database queries.",
+    instruction="You are a SQL expert. Write efficient, well-commented SQL.",
+)
+
+# Parent agent can invoke the SQL expert as a tool
+assistant = Agent(
+    name="engineering_assistant",
+    model="gemini-2.5-flash",
+    instruction="You are a helpful engineering assistant.",
+    tools=[
+        AgentTool(agent=sql_expert),      # Sub-agent as a tool
+        google_search,                     # Regular tool
+    ],
+)
+```
+
+**What the parent LLM sees:** `AgentTool._get_declaration()` generates a
+function declaration from the sub-agent. If the sub-agent defines an
+`input_schema`, the function parameters match that schema. Otherwise, it falls
+back to a generic `request: string` parameter:
+
+```json
+{
+  "name": "sql_expert",
+  "description": "Writes and optimizes SQL queries...",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "request": {"type": "string"}
+    },
+    "required": ["request"]
+  }
+}
+```
+
+**What happens when the LLM calls it:** `AgentTool.run_async()` creates an
+isolated `Runner` for the sub-agent:
+
+```
+Parent LLM calls: sql_expert(request="Write a query to find top customers")
+                              ↓
+AgentTool.run_async():
+  1. Parse input → Content(role='user', text='Write a query to...')
+  2. Create isolated Runner for sql_expert:
+     - InMemorySessionService (fresh session)
+     - ForwardingArtifactService (shares parent artifacts)
+     - Copies parent state (excluding _adk* internal keys)
+     - Inherits parent plugins (if include_plugins=True)
+  3. runner.run_async(new_message=content)
+     → sql_expert processes the request with its own LLM + tools
+  4. Forward state changes back to parent
+  5. runner.close()  (clean up MCP sessions, etc.)
+  6. Return last content as tool result
+                              ↓
+Parent LLM receives: FunctionResponse(name='sql_expert', response='SELECT ...')
+Parent LLM continues conversation with the result.
+```
+
+**With typed schemas:**
+
+```python
+from pydantic import BaseModel
+
+class SQLInput(BaseModel):
+    question: str
+    table_names: list[str]
+
+class SQLOutput(BaseModel):
+    query: str
+    explanation: str
+
+sql_expert = Agent(
+    name="sql_expert",
+    model="gemini-2.5-flash",
+    description="Writes SQL queries from natural language questions.",
+    input_schema=SQLInput,     # LLM sees typed parameters
+    output_schema=SQLOutput,   # Response is validated and structured
+    output_key="sql_result",   # Optionally save to state
+)
+```
+
+Now the parent LLM's function declaration has typed parameters
+(`question: string`, `table_names: string[]`) and the response is validated
+against `SQLOutput` before being returned.
 
 ---
 
