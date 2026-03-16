@@ -13,15 +13,26 @@ authentication is handled, and how the entire execution pipeline fits together.
 3. [Tool Types at a Glance](#3-tool-types-at-a-glance)
 4. [FunctionTool — Wrapping Python Functions](#4-functiontool--wrapping-python-functions)
 5. [MCP Tool Integration](#5-mcp-tool-integration)
+   - [MCP Transport Protocols: stdio, SSE, and Streamable HTTP](#mcp-transport-protocols-stdio-sse-and-streamable-http)
+   - [Comparison with Traditional Web Transport Protocols](#comparison-with-traditional-web-transport-protocols)
 6. [OpenAPI / REST API Tools](#6-openapi--rest-api-tools)
 7. [Google API Tools](#7-google-api-tools)
 8. [Built-in Google Search & Grounding Tools](#8-built-in-google-search--grounding-tools)
 9. [Database Tools (BigQuery, Bigtable, Spanner, Pub/Sub)](#9-database-tools-bigquery-bigtable-spanner-pubsub)
 10. [Third-Party Adapters (LangChain, CrewAI)](#10-third-party-adapters-langchain-crewai)
 11. [Skill Toolset](#11-skill-toolset)
+    - [Using SkillToolset in an Agent](#using-skilltoolset-in-an-agent)
+    - [Runtime Invocation Flow](#runtime-invocation-flow)
+    - [Skills vs. AgentTool](#skills-vs-agenttool-sub-agents-as-tools)
+    - [AgentTool — Wrapping Sub-Agents as Callable Tools](#agenttool--wrapping-sub-agents-as-callable-tools)
 12. [Retrieval Tools](#12-retrieval-tools)
 13. [Utility Tools](#13-utility-tools)
+    - [LoadMemoryTool — Cross-Session Memory Search](#loadmemorytool--cross-session-memory-search)
 14. [Authentication System](#14-authentication-system)
+    - [Where Credentials Are Stored](#where-credentials-are-stored)
+    - [Credential Lifecycle — The Complete Flow](#credential-lifecycle--the-complete-flow)
+    - [OAuth2 End-to-End: Authorization Code Flow](#oauth2-end-to-end-authorization-code-flow)
+    - [Auth System Component Summary](#auth-system-component-summary)
 15. [Tool Execution Flow (Runner → Agent → Tool)](#15-tool-execution-flow-runner--agent--tool)
 16. [ToolContext — What Tools Receive at Runtime](#16-toolcontext--what-tools-receive-at-runtime)
 17. [Toolsets and Filtering](#17-toolsets-and-filtering)
@@ -384,6 +395,177 @@ class LoadMcpResourceTool(BaseTool):
                 llm_request.contents.append(types.Content(parts=[part]))
 ```
 
+### MCP Transport Protocols: stdio, SSE, and Streamable HTTP
+
+The **Model Context Protocol (MCP)** is a standardized protocol that lets AI
+agents call external tools hosted in separate processes or servers. Think of it
+as a "USB-C for AI tools" — a universal interface so any agent can talk to any
+tool server. The question then becomes: **how do the bytes actually travel**
+between the agent and the MCP tool server? That's where these three transports
+come in.
+
+#### 1. Stdio (Standard I/O)
+
+**How it works:** The ADK spawns the MCP tool server as a **child process** on
+the same machine. Communication happens through the process's **stdin**
+(agent → server) and **stdout** (server → agent) — the same pipes you use when
+you `echo "hello" | grep hello`.
+
+**Why it exists:** It's the simplest, most reliable transport. No networking, no
+ports, no TLS, no CORS — just two processes talking through OS pipes. Zero
+configuration.
+
+**When to use it:** Local development, CLI tools, or when the tool server is
+bundled with your agent and runs on the same host.
+
+**In ADK code:** `StdioConnectionParams` wraps `StdioServerParameters` (from the
+MCP SDK). The session manager calls `stdio_client()` which spawns the child
+process. It doesn't support HTTP headers (there's no HTTP involved), and there's
+exactly one session key (`'stdio_session'`) since there's only one process.
+
+#### 2. SSE (Server-Sent Events)
+
+**How it works:** The agent connects to a remote MCP server over HTTP. It uses
+**Server-Sent Events** (a standard W3C API) for the **server → agent** direction
+(streaming responses), and regular **HTTP POST** requests for the **agent →
+server** direction (sending tool calls).
+
+**Why it exists:** It enables **remote** MCP servers — the tool server can run
+anywhere on the network. SSE is a mature, well-supported standard that works
+through proxies, load balancers, and CDNs.
+
+**When to use it:** When the MCP server is a remote service (e.g., running in a
+cloud), especially when you need one-way streaming from the server.
+
+**In ADK code:** `SseConnectionParams` takes a URL, optional headers (for auth
+tokens, etc.), and a separate `sse_read_timeout` (defaults to 5 minutes) because
+SSE connections are long-lived.
+
+#### 3. Streamable HTTP
+
+**How it works:** This is the **newest** MCP transport. It uses standard HTTP
+requests where the server **may optionally upgrade** the response to an SSE
+stream. If the response is short, it returns as a normal HTTP response. If it's
+long or streaming, it seamlessly upgrades to SSE within the same request.
+
+**Why it exists:** It combines the simplicity of plain HTTP (stateless,
+cacheable, works everywhere) with the streaming capability of SSE — **without
+requiring a persistent connection**. It also supports session resumption and is
+designed to be more robust for production deployments.
+
+**When to use it:** Production deployments, especially when you need the
+flexibility of both request/response and streaming patterns, or when you want
+better compatibility with HTTP infrastructure.
+
+**In ADK code:** `StreamableHTTPConnectionParams` adds a `httpx_client_factory`
+for custom HTTPX client configuration (e.g., mTLS, custom proxies) and
+`terminate_on_close` for lifecycle management.
+
+#### Transport Configuration
+
+Each transport has a corresponding config class in `mcp_session_manager.py`:
+
+| Config Class                      | Transport      | Key Fields                                  |
+|-----------------------------------|----------------|---------------------------------------------|
+| `StdioConnectionParams`          | Stdio          | `server_params`, `timeout`                  |
+| `SseConnectionParams`            | SSE            | `url`, `headers`, `timeout`, `sse_read_timeout` |
+| `StreamableHTTPConnectionParams` | Streamable HTTP | `url`, `headers`, `timeout`, `sse_read_timeout`, `httpx_client_factory` |
+
+The `McpToolsetConfig` validator enforces that **exactly one** transport is
+configured — they are mutually exclusive.
+
+#### Factory Pattern
+
+In `MCPSessionManager._create_client()`, the transport type is determined by the
+type of connection params:
+
+```
+StdioConnectionParams      → stdio_client()          (from mcp.client.stdio)
+SseConnectionParams        → sse_client()            (from mcp.client.sse)
+StreamableHTTPConnectionParams → streamablehttp_client() (from mcp.client.streamable_http)
+```
+
+#### Transport-Specific Session Pooling
+
+- **Stdio:** Single session key (`'stdio_session'`) — one process, one session.
+- **SSE / Streamable HTTP:** Session keys are MD5 hashes of merged headers,
+  enabling per-identity session pooling.
+
+#### Transport-Specific Timeout Handling
+
+- **Stdio:** Uses `timeout` for read operations (connection is instant — it's a
+  local process).
+- **SSE / Streamable HTTP:** Uses `sse_read_timeout` (default 5 minutes) for
+  read operations, since these are long-lived network connections.
+
+### Comparison with Traditional Web Transport Protocols
+
+| Aspect | HTTP/1.1 | HTTP/2 | WebSocket | MCP Stdio | MCP SSE | MCP Streamable HTTP |
+|--------|----------|--------|-----------|-----------|---------|---------------------|
+| **Direction** | Request/Response | Request/Response (multiplexed) | Full duplex | Full duplex (pipes) | Half duplex (POST up, SSE down) | Adaptive (req/res or streaming) |
+| **Connection** | One req per conn (or keep-alive) | Multiplexed streams on one conn | Persistent, upgraded from HTTP | OS process pipes | Long-lived HTTP + SSE | Stateless HTTP (optionally streaming) |
+| **Statefulness** | Stateless | Stateless | Stateful | Stateful (process lifetime) | Stateful (SSE connection) | **Stateless** (session ID optional) |
+| **Proxy/LB friendly** | ✅ Very | ✅ Very | ⚠️ Needs special support | N/A (local only) | ✅ Yes (standard HTTP) | ✅ Very (pure HTTP) |
+| **Streaming** | Chunked transfer only | Native stream support | Native | Native (pipes) | Server → Client only | Bidirectional (optional upgrade) |
+| **Overhead** | High (headers per request) | Low (binary, compressed headers) | Very low (frames) | ~Zero | Moderate (HTTP + SSE) | Low-Moderate |
+| **Use case** | Traditional web apps | Modern web apps, gRPC | Real-time apps (chat, games) | Local tool servers | Remote tool servers | Production tool servers |
+
+#### MCP SSE is built ON TOP of HTTP/1.1 (or HTTP/2)
+
+SSE itself is just a special `Content-Type: text/event-stream` HTTP response. It
+uses a standard HTTP connection — the innovation is that the response never
+"ends." The server keeps pushing events down the pipe. For the agent → server
+direction, it's plain HTTP POST. So MCP SSE is essentially **HTTP/1.1 + SSE**
+working together.
+
+#### MCP Streamable HTTP avoids WebSocket's problems
+
+WebSockets were the traditional answer to "I need bidirectional streaming." But
+they have real drawbacks: they require a protocol upgrade handshake, many
+proxies/CDNs/load balancers don't handle them well, they're stateful (if the
+connection drops, you lose context), and they bypass HTTP semantics (no caching,
+no standard auth headers per message). Streamable HTTP keeps everything in
+HTTP-land. Short interactions are plain request/response. Long interactions
+seamlessly upgrade the *response body* to SSE — but the *request* is still a
+normal HTTP POST. This means it works perfectly with all existing HTTP
+infrastructure.
+
+#### Stdio is analogous to Unix domain sockets / IPC
+
+In traditional web app architecture, you might use Unix domain sockets or named
+pipes for inter-process communication on the same host. MCP stdio serves the
+same purpose — fast, zero-overhead local communication.
+
+#### Why not just use WebSockets for MCP?
+
+WebSockets require maintaining a persistent connection and managing reconnection
+logic. They don't play well with serverless/FaaS environments. HTTP-based
+transports (SSE and Streamable HTTP) are more resilient — if a connection drops,
+the client can just make a new HTTP request. Streamable HTTP even supports
+session resumption with session IDs. MCP is primarily a **request/response**
+protocol (agent calls a tool, tool returns a result). Full-duplex streaming is
+rarely needed. The occasional server→client notification (like progress updates)
+is well-handled by SSE.
+
+#### Evolution mirrors the broader web industry
+
+Just as the web moved from HTTP/1.1 → HTTP/2 → HTTP/3 to get more efficient
+multiplexing while staying HTTP-compatible, MCP is moving from SSE (the first
+remote transport) → Streamable HTTP (more flexible, stateless, production-ready)
+while keeping the same protocol semantics.
+
+#### Transport Summary
+
+| Transport | Think of it as... | Best for |
+|-----------|-------------------|----------|
+| **Stdio** | Unix pipes / IPC | Local dev, CLI tools, bundled servers |
+| **SSE** | HTTP/1.1 + Server-Sent Events | Remote servers, simple deployments |
+| **Streamable HTTP** | HTTP/2-style adaptive streaming | Production, serverless, scalable deployments |
+
+The progression is: **local (stdio) → simple remote (SSE) → production remote
+(streamable HTTP)**, each building on standard, well-understood web primitives
+rather than inventing new protocols.
+
 ---
 
 ## 6. OpenAPI / REST API Tools
@@ -698,48 +880,449 @@ class CrewaiTool(FunctionTool):
 ## 11. Skill Toolset
 
 Skills are structured instruction folders that extend an agent's capabilities.
-The `SkillToolset` provides three sub-tools for skill management:
+Unlike other tool types that execute code, skills are **dynamic prompt
+injection** — they load curated instructions and resources into the LLM's
+context at runtime so the agent can follow specialized workflows.
+
+> **Important distinction:** Skills are **not** MCP servers, API endpoints, or
+> executable code. They are local folders of markdown instructions and resources
+> that are dynamically loaded into the LLM context. The LLM then follows those
+> instructions using its existing tools.
+
+### Skill Data Model
+
+A skill has three layers of content, loaded progressively:
+
+```python
+# src/google/adk/skills/models.py
+
+class Skill(BaseModel):
+    frontmatter: Frontmatter   # L1: Metadata for discovery (always loaded)
+    instructions: str          # L2: Main instructions from SKILL.md body
+    resources: Resources       # L3: Additional files loaded on demand
+
+class Frontmatter(BaseModel):
+    name: str                  # Skill name in kebab-case (required)
+    description: str           # What the skill does (required)
+    license: Optional[str]     # License information
+    compatibility: Optional[str]
+    allowed_tools: Optional[str]  # Tool patterns the skill requires
+    metadata: dict[str, str] = {}
+
+class Resources(BaseModel):
+    references: dict[str, str] = {}   # Additional markdown documentation
+    assets: dict[str, str] = {}       # Templates, schemas, examples
+    scripts: dict[str, Script] = {}   # Executable scripts
+```
+
+### Skill Folder Structure
+
+```
+my-code-review-skill/
+├── SKILL.md              # Required — frontmatter + instructions
+├── references/           # Optional — extra docs loaded via load_skill_resource
+│   ├── style-guide.md
+│   └── review-checklist.md
+├── assets/               # Optional — templates, schemas, examples
+│   ├── pr-template.md
+│   └── severity-scale.json
+└── scripts/              # Optional — executable scripts
+    └── run-linter.sh
+```
+
+### SKILL.md Format
+
+The `SKILL.md` file uses YAML frontmatter followed by markdown instructions:
+
+```markdown
+---
+name: code-review
+description: >
+  Performs structured code reviews following team standards.
+  Use this skill when the user asks for a code review,
+  PR review, or feedback on code quality.
+license: Apache-2.0
+compatibility: "gemini-2.5-flash, gemini-2.5-pro"
+allowed_tools: "google_search, load_skill_resource"
+metadata:
+  author: "platform-team"
+  version: "1.2.0"
+---
+
+# Code Review Skill
+
+## Steps
+
+1. First, ask the user to provide the code or PR diff.
+2. Load the style guide: use `load_skill_resource` with
+   path `references/style-guide.md`.
+3. Review the code against each item in the checklist at
+   `references/review-checklist.md`.
+4. Rate each finding using the severity scale at
+   `assets/severity-scale.json`.
+5. Format your response using the template at
+   `assets/pr-template.md`.
+```
+
+### Loading Skills from Disk
+
+ADK provides `load_skill_from_dir()` to parse skill directories:
+
+```python
+# src/google/adk/skills/utils.py
+
+def load_skill_from_dir(skill_dir: Union[str, pathlib.Path]) -> models.Skill:
+    """Load a complete skill from a directory."""
+    skill_dir = pathlib.Path(skill_dir).resolve()
+
+    # 1. Find and parse SKILL.md (or skill.md)
+    content = skill_md.read_text(encoding="utf-8")
+    parts = content.split("---", 2)       # Split frontmatter from body
+    frontmatter = models.Frontmatter(**yaml.safe_load(parts[1]))
+    body = parts[2].strip()
+
+    # 2. Recursively load all files from subdirectories
+    references = _load_dir(skill_dir / "references")
+    assets = _load_dir(skill_dir / "assets")
+    scripts = {
+        name: models.Script(src=content)
+        for name, content in _load_dir(skill_dir / "scripts").items()
+    }
+
+    return models.Skill(
+        frontmatter=frontmatter,
+        instructions=body,
+        resources=models.Resources(
+            references=references, assets=assets, scripts=scripts
+        ),
+    )
+```
+
+### Using SkillToolset in an Agent
+
+Here's a complete example of building an agent with skills:
+
+```python
+from google.adk.agents import Agent
+from google.adk.skills.utils import load_skill_from_dir
+from google.adk.tools.skill_toolset import SkillToolset
+
+# 1. Load skills from disk
+code_review_skill = load_skill_from_dir("./skills/code-review")
+testing_skill = load_skill_from_dir("./skills/testing-strategy")
+
+# 2. Create the toolset
+skill_toolset = SkillToolset(skills=[code_review_skill, testing_skill])
+
+# 3. Attach to an agent (alongside other tools)
+agent = Agent(
+    name="engineering_assistant",
+    model="gemini-2.5-flash",
+    instruction="You are a senior engineering assistant.",
+    tools=[
+        skill_toolset,           # Skills for specialized workflows
+        google_search,           # Regular tool for web search
+    ],
+)
+```
+
+### SkillToolset Internals
+
+The `SkillToolset` exposes **three tools** to the LLM and injects a system
+instruction that teaches the LLM how to use them:
 
 ```python
 # src/google/adk/tools/skill_toolset.py
 
 class SkillToolset(BaseToolset):
-    """Manages skill discovery and loading."""
-
     def __init__(self, skills: list[models.Skill]):
-        self._skills = skills
-
-    async def get_tools(self, readonly_context=None) -> list[BaseTool]:
-        return [
-            ListSkillsTool(self),     # Lists all available skills
-            LoadSkillTool(self),      # Loads a specific skill's instructions
-            LoadSkillResourceTool(self),  # Loads files within a skill folder
+        self._skills = {skill.name: skill for skill in skills}
+        self._tools = [
+            ListSkillsTool(self),           # list_skills()
+            LoadSkillTool(self),            # load_skill(name=...)
+            LoadSkillResourceTool(self),    # load_skill_resource(skill_name=..., path=...)
         ]
 
+    async def get_tools(self, readonly_context=None) -> list[BaseTool]:
+        return self._tools
+
     async def process_llm_request(self, *, tool_context, llm_request):
-        """Inject skill system instructions into LLM request."""
-        llm_request.config.system_instruction += DEFAULT_SKILL_SYSTEM_INSTRUCTION
+        """Inject skill catalog and system instruction into LLM request."""
+        skill_frontmatters = self._list_skills()
+        skills_xml = prompt.format_skills_as_xml(skill_frontmatters)
+        llm_request.append_instructions([skills_xml])
 ```
 
-**Skill folder structure:**
+The `process_llm_request` hook runs **before** the LLM call. It appends an XML
+catalog of available skills to the system instruction:
+
+```xml
+<available_skills>
+<skill>
+<name>code-review</name>
+<description>Performs structured code reviews following team standards.</description>
+</skill>
+<skill>
+<name>testing-strategy</name>
+<description>Designs test plans for new features.</description>
+</skill>
+</available_skills>
+```
+
+The injected system instruction tells the LLM:
+
+> _"You can use specialized 'skills' to help you with complex tasks. You MUST
+> use the skill tools to interact with these skills. If a skill seems relevant
+> to the current user query, you MUST use the `load_skill` tool with
+> `name="<SKILL_NAME>"` to read its full instructions before proceeding. Once
+> you have read the instructions, follow them exactly as documented."_
+
+### The Three Skill Tools
+
+**`list_skills()`** — No parameters. Returns the XML catalog of all available
+skills with their names and descriptions.
+
+```python
+class ListSkillsTool(BaseTool):
+    # FunctionDeclaration: no parameters
+    async def run_async(self, *, args, tool_context):
+        skill_frontmatters = self._toolset._list_skills()
+        return prompt.format_skills_as_xml(skill_frontmatters)
+```
+
+**`load_skill(name)`** — Takes a skill name, returns the full SKILL.md
+instructions and frontmatter metadata.
+
+```python
+class LoadSkillTool(BaseTool):
+    # FunctionDeclaration: required parameter "name" (string)
+    async def run_async(self, *, args, tool_context):
+        skill = self._toolset._get_skill(args["name"])
+        return {
+            "skill_name": skill_name,
+            "instructions": skill.instructions,    # Full SKILL.md body
+            "frontmatter": skill.frontmatter.model_dump(),
+        }
+```
+
+**`load_skill_resource(skill_name, path)`** — Loads a specific file from within
+a skill's `references/` or `assets/` directories.
+
+```python
+class LoadSkillResourceTool(BaseTool):
+    # FunctionDeclaration: required "skill_name" + "path"
+    async def run_async(self, *, args, tool_context):
+        skill = self._toolset._get_skill(args["skill_name"])
+        resource_path = args["path"]
+
+        if resource_path.startswith("references/"):
+            content = skill.resources.get_reference(
+                resource_path[len("references/"):]
+            )
+        elif resource_path.startswith("assets/"):
+            content = skill.resources.get_asset(
+                resource_path[len("assets/"):]
+            )
+
+        return {"skill_name": skill_name, "path": resource_path, "content": content}
+```
+
+### Runtime Invocation Flow
+
+Here's the complete sequence of what happens when a user asks a question that
+matches a skill:
 
 ```
-my_skill/
-├── SKILL.md           # Main instructions with metadata
-├── references/        # Documentation / examples
-└── assets/            # Templates, scripts, resources
+User: "Can you review this PR diff for me?"
+
+┌──────────────────────────────────────────────────────────────────────┐
+│ STEP 1: LLM Request Preparation                                     │
+│──────────────────────────────────────────────────────────────────────│
+│ SkillToolset.process_llm_request() runs before the LLM call:        │
+│                                                                      │
+│ System instruction now includes:                                     │
+│  • Original agent instruction                                       │
+│  • Skill system prompt ("You can use specialized skills...")         │
+│  • XML catalog of available skills                                   │
+│                                                                      │
+│ Function declarations added:                                         │
+│  • list_skills()                                                     │
+│  • load_skill(name: string)                                          │
+│  • load_skill_resource(skill_name: string, path: string)             │
+└──────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌──────────────────────────────────────────────────────────────────────┐
+│ STEP 2: LLM Decides to Load Skill                                   │
+│──────────────────────────────────────────────────────────────────────│
+│ The LLM sees "code-review" in the skill catalog and recognizes      │
+│ the user's request matches. It calls:                                │
+│                                                                      │
+│   load_skill(name="code-review")                                     │
+│                                                                      │
+│ Returns:                                                             │
+│   {                                                                  │
+│     "skill_name": "code-review",                                     │
+│     "instructions": "# Code Review Skill\n\n## Steps\n1. First...", │
+│     "frontmatter": {"name": "code-review", "description": "...",     │
+│                      "allowed_tools": "google_search, ..."}          │
+│   }                                                                  │
+└──────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌──────────────────────────────────────────────────────────────────────┐
+│ STEP 3: LLM Follows Skill Instructions                               │
+│──────────────────────────────────────────────────────────────────────│
+│ The skill instructions say to load the style guide, so LLM calls:   │
+│                                                                      │
+│   load_skill_resource(                                               │
+│     skill_name="code-review",                                        │
+│     path="references/style-guide.md"                                 │
+│   )                                                                  │
+│                                                                      │
+│ Returns: {"content": "# Style Guide\n\n## Naming conventions..."}   │
+│                                                                      │
+│ The LLM also loads the review checklist and severity scale as       │
+│ instructed by the skill.                                             │
+└──────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌──────────────────────────────────────────────────────────────────────┐
+│ STEP 4: LLM Produces Final Response                                  │
+│──────────────────────────────────────────────────────────────────────│
+│ With the skill instructions, style guide, checklist, and severity   │
+│ scale all loaded into context, the LLM performs the code review     │
+│ following the exact workflow defined in the skill.                   │
+│                                                                      │
+│ The response follows the template from assets/pr-template.md.       │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-**How skills work at runtime:**
+### Skills vs. AgentTool (Sub-Agents as Tools)
 
-1. Agent receives the skill system instruction telling it skills are available.
-2. Agent calls `list_skills` to see what's available.
-3. Agent calls `load_skill(name="my_skill")` to read `SKILL.md`.
-4. Agent follows the instructions from the skill.
-5. If needed, agent calls `load_skill_resource(name="my_skill", path="assets/template.txt")`.
+Skills and `AgentTool` solve different problems:
 
-Skills are **not** MCP servers. They are local folders of markdown instructions
-and resources that are dynamically loaded into the LLM context.
+| Aspect | SkillToolset | AgentTool |
+|--------|-------------|-----------|
+| **What it wraps** | Markdown instructions + resources | A full `Agent` instance |
+| **Execution** | LLM reads instructions and follows them | Spawns an isolated Runner for the sub-agent |
+| **State** | Shares the same LLM context window | Sub-agent gets a copy of parent state |
+| **Tools** | Uses the parent agent's existing tools | Sub-agent has its own tool set |
+| **Use case** | Structured workflows, templates, checklists | Delegating to a specialist agent with different model/tools |
+
+`AgentTool` is covered in detail in the next section.
+
+### AgentTool — Wrapping Sub-Agents as Callable Tools
+
+While skills inject instructions into the current agent's context, `AgentTool`
+takes a fundamentally different approach: it wraps an entire agent as a
+callable function that the parent LLM can invoke.
+
+```python
+# src/google/adk/tools/agent_tool.py
+
+class AgentTool(BaseTool):
+    """Wraps an agent as a callable tool."""
+
+    def __init__(self, agent, skip_summarization=False, *, include_plugins=True):
+        self.agent = agent
+        self.skip_summarization = skip_summarization
+        self.include_plugins = include_plugins
+        super().__init__(name=agent.name, description=agent.description)
+```
+
+**Example: Agent with a specialist sub-agent as a tool:**
+
+```python
+from google.adk.agents import Agent
+from google.adk.tools.agent_tool import AgentTool
+
+# Define a specialist sub-agent
+sql_expert = Agent(
+    name="sql_expert",
+    model="gemini-2.5-flash",
+    description="Writes and optimizes SQL queries. Call this when the user "
+                "needs help with database queries.",
+    instruction="You are a SQL expert. Write efficient, well-commented SQL.",
+)
+
+# Parent agent can invoke the SQL expert as a tool
+assistant = Agent(
+    name="engineering_assistant",
+    model="gemini-2.5-flash",
+    instruction="You are a helpful engineering assistant.",
+    tools=[
+        AgentTool(agent=sql_expert),      # Sub-agent as a tool
+        google_search,                     # Regular tool
+    ],
+)
+```
+
+**What the parent LLM sees:** `AgentTool._get_declaration()` generates a
+function declaration from the sub-agent. If the sub-agent defines an
+`input_schema`, the function parameters match that schema. Otherwise, it falls
+back to a generic `request: string` parameter:
+
+```json
+{
+  "name": "sql_expert",
+  "description": "Writes and optimizes SQL queries...",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "request": {"type": "string"}
+    },
+    "required": ["request"]
+  }
+}
+```
+
+**What happens when the LLM calls it:** `AgentTool.run_async()` creates an
+isolated `Runner` for the sub-agent:
+
+```
+Parent LLM calls: sql_expert(request="Write a query to find top customers")
+                              ↓
+AgentTool.run_async():
+  1. Parse input → Content(role='user', text='Write a query to...')
+  2. Create isolated Runner for sql_expert:
+     - InMemorySessionService (fresh session)
+     - ForwardingArtifactService (shares parent artifacts)
+     - Copies parent state (excluding _adk* internal keys)
+     - Inherits parent plugins (if include_plugins=True)
+  3. runner.run_async(new_message=content)
+     → sql_expert processes the request with its own LLM + tools
+  4. Forward state changes back to parent
+  5. runner.close()  (clean up MCP sessions, etc.)
+  6. Return last content as tool result
+                              ↓
+Parent LLM receives: FunctionResponse(name='sql_expert', response='SELECT ...')
+Parent LLM continues conversation with the result.
+```
+
+**With typed schemas:**
+
+```python
+from pydantic import BaseModel
+
+class SQLInput(BaseModel):
+    question: str
+    table_names: list[str]
+
+class SQLOutput(BaseModel):
+    query: str
+    explanation: str
+
+sql_expert = Agent(
+    name="sql_expert",
+    model="gemini-2.5-flash",
+    description="Writes SQL queries from natural language questions.",
+    input_schema=SQLInput,     # LLM sees typed parameters
+    output_schema=SQLOutput,   # Response is validated and structured
+    output_key="sql_result",   # Optionally save to state
+)
+```
+
+Now the parent LLM's function declaration has typed parameters
+(`question: string`, `table_names: string[]`) and the response is validated
+against `SQLOutput` before being returned.
 
 ---
 
@@ -778,21 +1361,227 @@ class BaseRetrievalTool(BaseTool):
 
 ## 13. Utility Tools
 
-### LoadMemoryTool — Session Memory Search
+### LoadMemoryTool — Cross-Session Memory Search
+
+`LoadMemoryTool` gives an agent the ability to recall information from **past
+sessions** with the same user. Unlike session history (which is automatically
+available within a single conversation), memory is a **cross-session recall
+system** that the LLM explicitly queries when it needs to remember something
+from a previous interaction.
+
+#### Memory Scope
+
+Memory is scoped **per-user-per-app** — not per-session, not per-organization.
+
+```python
+# src/google/adk/memory/base_memory_service.py
+
+async def search_memory(
+    self,
+    *,
+    app_name: str,    # App-level isolation
+    user_id: str,     # User-level isolation
+    query: str,       # Semantic search query
+) -> SearchMemoryResponse:
+```
+
+- **Per-user:** Memory from user A is never visible to user B.
+- **Per-app:** Memory stored under app X is not visible to app Y.
+- **Cross-session:** Memory spans all sessions for a given (app, user) pair —
+  the whole point is recalling facts from previous conversations.
+- **Session-tagged:** Events are optionally tagged with `session_id` during
+  ingestion so backends can track provenance, but search always returns results
+  across all sessions.
+
+#### Memory vs. Session History
+
+Memory and session history are **separate systems** with different scopes and
+purposes:
+
+| Aspect | Session History | Memory |
+|--------|----------------|--------|
+| **Scope** | Single session | All sessions for a user |
+| **Content** | All events (messages, function calls, state) | Filtered events (text content only) |
+| **Written** | Automatically by Runner | Manually via `add_session_to_memory()` |
+| **Read** | Loaded from `SessionService` on each turn | Searched via `LoadMemoryTool` or `PreloadMemoryTool` |
+| **Query** | By `session_id` | By semantic/keyword query |
+| **Purpose** | Conversation context for current session | Recall past interactions across sessions |
+| **Storage** | SessionService (in-memory, Spanner, Vertex AI) | MemoryService (in-memory, RAG, Memory Bank) |
+
+#### How LoadMemoryTool Works
 
 ```python
 # src/google/adk/tools/load_memory_tool.py
 
 class LoadMemoryTool(FunctionTool):
-    async def process_llm_request(self, *, tool_context, llm_request):
-        """Add memory instruction to system prompt."""
-        llm_request.config.system_instruction += MEMORY_INSTRUCTION
+    """Tool that lets the LLM search memory on demand."""
 
-async def load_memory(query: str, tool_context: ToolContext) -> LoadMemoryResponse:
-    """Search session memory for relevant past interactions."""
-    results = await tool_context.search_memory(query)
-    return LoadMemoryResponse(memories=results)
+    async def process_llm_request(self, *, tool_context, llm_request):
+        """Inject instructions telling the LLM it has memory."""
+        llm_request.append_instructions([
+            "You have memory. You can use it to answer questions. "
+            "If any questions need you to look up the memory, you "
+            "should call load_memory function with a query."
+        ])
+
+# The underlying function:
+async def load_memory(
+    query: str, tool_context: ToolContext
+) -> LoadMemoryResponse:
+    """Loads memory for the current user."""
+    search_memory_response = await tool_context.search_memory(query)
+    return LoadMemoryResponse(memories=search_memory_response.memories)
+
+class LoadMemoryResponse(BaseModel):
+    memories: list[MemoryEntry] = Field(default_factory=list)
 ```
+
+The `process_llm_request` hook injects a system instruction on every LLM call
+so the model knows it can recall past interactions. When the LLM decides to
+call `load_memory(query="...")`, the tool delegates to
+`tool_context.search_memory()` which calls the configured memory service with
+the current `app_name` and `user_id` automatically.
+
+#### Memory Lifecycle
+
+```
+Session 1 (January):
+  User: "My favorite language is Python"
+  Agent: "Great choice!"
+  → Events stored in SessionService automatically
+
+Explicit memory update (manual trigger):
+  add_session_to_memory(session)
+  → Memory service filters events (removes function calls, empty events)
+  → Stores text content indexed by (app_name, user_id)
+
+Session 2 (March):
+  User: "What programming language do I prefer?"
+  → LLM sees "You have memory" in system instruction
+  → LLM calls: load_memory(query="favorite programming language")
+  → MemoryService.search_memory(app_name=..., user_id=..., query=...)
+  → Returns: MemoryEntry(content="My favorite language is Python", author="user")
+  → LLM: "You mentioned that Python is your favorite language!"
+```
+
+**Key design choice:** Memory writes are **not automatic**. Unlike session
+history (which the Runner appends to after every turn), memory must be
+explicitly populated via one of:
+
+1. **`add_session_to_memory(session)`** — Ingests all events from a session.
+2. **`add_events_to_memory(events)`** — Ingests a specific subset of events
+   (e.g., just the latest turn).
+3. **CLI endpoint** — `POST /update_memory` in the ADK web server.
+4. **Agent callbacks** — Custom code that calls `ctx.add_session_to_memory()`.
+
+#### Storage Backends
+
+ADK provides three memory service implementations:
+
+**1. `InMemoryMemoryService`** — Development/testing only.
+
+```python
+# Stores events in a Python dict keyed by "{app_name}/{user_id}"
+# Search: case-insensitive keyword matching (extracts words via regex)
+
+memory_service = InMemoryMemoryService()
+```
+
+Search mechanism is simple word overlap — if any word from the query appears
+in an event's text, it's returned:
+
+```python
+# Simplified from in_memory_memory_service.py
+words_in_query = _extract_words_lower(query)   # {"python", "favorite"}
+words_in_event = _extract_words_lower(event_text)  # {"my", "favorite", "language", "is", "python"}
+
+if any(word in words_in_event for word in words_in_query):
+    # Match — return this event
+```
+
+**2. `VertexAiRagMemoryService`** — Semantic search via Vertex AI RAG.
+
+```python
+# Stores events as JSON lines uploaded to a Vertex AI RAG corpus.
+# Search: vector embedding similarity (semantic, not keyword).
+
+memory_service = VertexAiRagMemoryService(
+    rag_corpus="projects/{proj}/locations/{loc}/ragCorpora/{id}",
+    similarity_top_k=10,          # Max results
+    vector_distance_threshold=10,  # Similarity cutoff
+)
+```
+
+Events are serialized as JSON lines (`{"author": "user", "timestamp": ...,
+"text": "..."}`) and uploaded as files with display names encoding
+`{app_name}.{user_id}.{session_id}`. Search uses Vertex AI's embedding-based
+retrieval, returning semantically similar content even if exact keywords don't
+match.
+
+**3. `VertexAiMemoryBankService`** — AI-powered memory extraction.
+
+```python
+# Uses Vertex AI Agent Engine to extract and store facts from conversations.
+# Search: server-side similarity search over extracted facts.
+
+memory_service = VertexAiMemoryBankService(
+    project="my-gcp-project",
+    location="us-central1",
+    agent_engine_id="my-reasoning-engine-id",
+)
+```
+
+Unlike the other backends, Memory Bank uses an LLM to **extract structured
+facts** from conversation events (e.g., "User prefers Python" from "My
+favorite language is Python"). Supports TTL/expiration, metadata propagation,
+and versioning.
+
+| Feature | InMemory | Vertex AI RAG | Vertex AI Memory Bank |
+|---------|----------|---------------|----------------------|
+| **Use case** | Testing | Semantic search | AI-powered extraction |
+| **Search** | Keyword overlap | Vector embeddings | LLM-extracted facts |
+| **Persistence** | RAM only | Cloud RAG corpus | Vertex AI Memory Bank |
+| **Cost** | Free | GCP API charges | GCP API charges |
+| **TTL support** | No | No | Yes |
+
+#### Wiring Memory into an Agent
+
+```python
+from google.adk.agents import Agent
+from google.adk.runners import Runner
+from google.adk.tools.load_memory_tool import LoadMemoryTool
+from google.adk.memory.in_memory_memory_service import InMemoryMemoryService
+from google.adk.sessions.in_memory_session_service import InMemorySessionService
+
+agent = Agent(
+    name="assistant",
+    model="gemini-2.5-flash",
+    instruction="You are a helpful assistant with memory of past conversations.",
+    tools=[LoadMemoryTool()],   # Gives the LLM the ability to search memory
+)
+
+runner = Runner(
+    app_name="my_app",
+    agent=agent,
+    session_service=InMemorySessionService(),
+    memory_service=InMemoryMemoryService(),  # Or VertexAiRagMemoryService(...)
+)
+
+# After a session ends, persist it to memory:
+session = await runner.session_service.get_session(
+    app_name="my_app", user_id="user123", session_id="session-abc"
+)
+await runner.memory_service.add_session_to_memory(session)
+
+# In the next session, LoadMemoryTool will find these memories when the LLM
+# searches for relevant context.
+```
+
+> **Note:** There is also `PreloadMemoryTool` which automatically searches
+> memory using the user's first message and injects results into the LLM
+> request before the model runs — no explicit tool call needed. Use
+> `LoadMemoryTool` when you want the LLM to decide when to search; use
+> `PreloadMemoryTool` when you always want memory context available.
 
 ### LoadArtifactsTool — Artifact Loading
 
@@ -856,7 +1645,8 @@ class ComputerUseTool(FunctionTool):
 ## 14. Authentication System
 
 Authentication is one of the most sophisticated parts of the tools system. It
-supports multiple auth mechanisms and handles the complete credential lifecycle.
+supports multiple auth mechanisms and handles the complete credential lifecycle
+including storage, exchange, refresh, and injection into HTTP requests.
 
 ### Auth Data Models
 
@@ -864,125 +1654,384 @@ supports multiple auth mechanisms and handles the complete credential lifecycle.
 # src/google/adk/auth/auth_credential.py
 
 class AuthCredentialTypes(str, Enum):
-    API_KEY = "apiKey"
-    HTTP = "http"
-    OAUTH2 = "oauth2"
-    OPEN_ID_CONNECT = "openIdConnect"
-    SERVICE_ACCOUNT = "serviceAccount"
+    API_KEY = "apiKey"              # Static API key
+    HTTP = "http"                   # Bearer token, Basic auth
+    OAUTH2 = "oauth2"              # OAuth2 flows
+    OPEN_ID_CONNECT = "openIdConnect"  # OIDC (extends OAuth2)
+    SERVICE_ACCOUNT = "serviceAccount"  # Google Service Account
 
 class AuthCredential(BaseModel):
     auth_type: AuthCredentialTypes
-    resource_ref: Optional[str] = None
-    api_key: Optional[str] = None
-    http: Optional[HttpAuth] = None           # Bearer tokens, Basic auth
-    service_account: Optional[ServiceAccount] = None
-    oauth2: Optional[OAuth2Auth] = None       # OAuth2 / OIDC tokens
+    resource_ref: Optional[str] = None  # Future: reference to external secret
 
-class OAuth2Auth(BaseModel):
-    client_id: Optional[str] = None
-    client_secret: Optional[str] = None
-    auth_uri: Optional[str] = None
-    auth_code: Optional[str] = None
-    access_token: Optional[str] = None
-    refresh_token: Optional[str] = None
-    expires_at: Optional[int] = None
+    # --- API Key ---
+    api_key: Optional[str] = None       # The key value itself
+
+    # --- HTTP Auth ---
+    http: Optional[HttpAuth] = None
+    # HttpAuth contains:
+    #   scheme: str                     # "bearer" or "basic"
+    #   credentials: HttpCredentials
+    #     token: Optional[str]          # Bearer token value
+    #     username: Optional[str]       # Basic auth username
+    #     password: Optional[str]       # Basic auth password
+    #   additional_headers: Optional[Dict[str, str]]
+
+    # --- Service Account ---
+    service_account: Optional[ServiceAccount] = None
+    # ServiceAccount contains:
+    #   service_account_credential: Optional[ServiceAccountCredential]
+    #     type_, project_id, private_key_id, private_key,
+    #     client_email, client_id, auth_uri, token_uri,
+    #     auth_provider_x509_cert_url, client_x509_cert_url
+    #   scopes: List[str]              # OAuth scopes to request
+    #   use_default_credential: Optional[bool]  # Use ADC instead
+
+    # --- OAuth2 / OIDC ---
+    oauth2: Optional[OAuth2Auth] = None
+    # OAuth2Auth contains:
+    #   client_id: Optional[str]       # App registration
+    #   client_secret: Optional[str]   # App secret
+    #   auth_uri: Optional[str]        # Generated authorization URL
+    #   state: Optional[str]           # CSRF protection token (auto-generated)
+    #   redirect_uri: Optional[str]    # Where to redirect after auth
+    #   auth_response_uri: Optional[str]  # Response URL with auth code
+    #   auth_code: Optional[str]       # Authorization code from redirect
+    #   access_token: Optional[str]    # The bearer token (after exchange)
+    #   refresh_token: Optional[str]   # For token renewal
+    #   expires_at: Optional[int]      # Token expiration timestamp
+    #   expires_in: Optional[int]      # Token lifetime in seconds
+    #   audience: Optional[str]        # Target audience
+    #   token_endpoint_auth_method: Optional[str]
+    #     # "client_secret_basic" | "client_secret_post" | "none"
 ```
 
-### Auth Config
+### Auth Config — Connecting Credentials to Tools
+
+`AuthConfig` links a security scheme definition to actual credentials and
+provides a stable key for credential storage:
 
 ```python
 # src/google/adk/auth/auth_tool.py
 
 class AuthConfig(BaseModel):
-    auth_scheme: AuthScheme           # Security scheme definition (OpenAPI-style)
-    raw_auth_credential: Optional[AuthCredential] = None     # Input credential
-    exchanged_auth_credential: Optional[AuthCredential] = None  # After exchange
+    auth_scheme: AuthScheme
+      # The security scheme from the OpenAPI spec (APIKey, HTTPBearer, OAuth2, etc.)
+
+    raw_auth_credential: Optional[AuthCredential] = None
+      # The credential as provided by the developer or client.
+      # For API key: directly usable (contains the key value).
+      # For OAuth2: contains client_id + client_secret (needs exchange).
+      # For service account: contains the JSON key file data.
+
+    exchanged_auth_credential: Optional[AuthCredential] = None
+      # The credential after ADK processes it:
+      # For OAuth2: auth_uri + state generated (before user login),
+      #   then access_token + refresh_token (after exchange).
+      # For service account: access_token from google.auth.
+      # For API key: same as raw_auth_credential.
+
+    credential_key: Optional[str] = None
+      # Unique storage key, auto-generated if not provided.
+      # Format: "adk_{scheme_name}_{scheme_sha256}_{cred_type}_{cred_sha256}"
+      # Stable across Python hash seeds (uses SHA256, not hash()).
 ```
 
-### The Auth Flow
+The `credential_key` is central to the caching system. It's deterministically
+derived from the auth scheme and credential content, so the same tool + same
+credential always maps to the same cache key:
 
-```
-┌─────────────┐     ┌──────────────────┐     ┌──────────────────────┐
-│ Tool invoked │────▶│ ToolAuthHandler  │────▶│ CredentialStore      │
-│              │     │                  │     │ (in ToolContext.state)│
-└─────────────┘     └──────────────────┘     └──────────────────────┘
-                           │                            │
-                    ┌──────▼──────────┐         Has cached credential?
-                    │ Check cache     │────────── Yes ──▶ Use it
-                    │                 │
-                    │ No cached cred  │
-                    └──────┬──────────┘
-                           │
-                    ┌──────▼──────────────────────────┐
-                    │ AutoAuthCredentialExchanger      │
-                    │                                  │
-                    │ Routes to specific exchanger:    │
-                    │  ├─ OAuth2CredentialExchanger    │
-                    │  ├─ ServiceAccountExchanger      │
-                    │  └─ Custom exchangers            │
-                    └──────┬──────────────────────────┘
-                           │
-                    ┌──────▼──────────┐
-                    │ Exchange result  │
-                    │                  │
-                    │ Success? ───▶ Cache & use
-                    │ Need user? ──▶ Request user auth (pause tool)
-                    └─────────────────┘
+```python
+# Auto-generation in AuthConfig.__init__()
+def get_credential_key(self) -> str:
+    scheme_digest = hashlib.sha256(
+        self.auth_scheme.model_dump_json().encode()
+    ).hexdigest()[:16]
+    cred_digest = hashlib.sha256(
+        self.raw_auth_credential.model_dump_json().encode()
+    ).hexdigest()[:16]
+    return f"adk_{scheme_name}_{scheme_digest}_{cred_type}_{cred_digest}"
 ```
 
-### ToolAuthHandler — Core Orchestrator
+### Where Credentials Are Stored
+
+ADK provides two built-in credential services plus a tool-level store:
+
+#### 1. `InMemoryCredentialService` — Development/Testing
+
+```python
+# src/google/adk/auth/credential_service/in_memory_credential_service.py
+
+class InMemoryCredentialService(BaseCredentialService):
+    # Stores in a Python dict keyed by "{app_name}/{user_id}/{credential_key}"
+    # Scoped per app and per user — no cross-user access
+    # Lost on process restart
+```
+
+#### 2. `SessionStateCredentialService` — Persistent via Session
+
+```python
+# src/google/adk/auth/credential_service/session_state_credential_service.py
+
+class SessionStateCredentialService(BaseCredentialService):
+    async def load_credential(self, auth_config, callback_context):
+        # Reads from: callback_context.state[credential_key]
+        # Persists across invocations via session state storage
+
+    async def save_credential(self, auth_config, callback_context):
+        # Writes to: callback_context.state[credential_key]
+        # WARNING: Not secure for production — tokens stored in session state
+```
+
+#### 3. `ToolContextCredentialStore` — OpenAPI Tool Cache
 
 ```python
 # src/google/adk/tools/openapi_tool/openapi_spec_parser/tool_auth_handler.py
 
-class ToolAuthHandler:
-    async def prepare_auth_credentials(self, tool_context):
-        # 1. Check credential store for cached credential
-        cached = credential_store.load(credential_key)
-        if cached and not expired:
-            return cached
-
-        # 2. Try refresh (OAuth2 / OIDC)
-        if has_refresh_token:
-            refreshed = OAuth2CredentialRefresher().refresh(credential)
-            credential_store.save(refreshed)
-            return refreshed
-
-        # 3. Try exchange via AutoAuthCredentialExchanger
-        exchanged = AutoAuthCredentialExchanger().exchange(auth_scheme, raw_credential)
-        if exchanged:
-            credential_store.save(exchanged)
-            return exchanged
-
-        # 4. Request user authorization
-        tool_context.request_credential(auth_config)
-        return None  # Tool returns "Pending User Authorization"
+# Used internally by OpenAPI tools. Stores in tool_context.state
+# with legacy key migration support for backwards compatibility.
+# Key format: "{scheme_digest}_{credential_digest}_existing_exchanged_credential"
 ```
 
-### How Auth Credentials Become HTTP Params
+**The `BaseCredentialService` interface** that all implementations follow:
+
+```python
+# src/google/adk/auth/credential_service/base_credential_service.py
+
+class BaseCredentialService(ABC):
+    @abstractmethod
+    async def load_credential(
+        self,
+        auth_config: AuthConfig,       # Contains credential_key for lookup
+        callback_context: CallbackContext,  # Provides app_name, user_id, state
+    ) -> Optional[AuthCredential]:
+
+    @abstractmethod
+    async def save_credential(
+        self,
+        auth_config: AuthConfig,       # Contains exchanged_auth_credential
+        callback_context: CallbackContext,
+    ) -> None:
+```
+
+Developers can implement custom backends (e.g., Google Secret Manager,
+HashiCorp Vault, database-backed) by extending `BaseCredentialService`.
+
+### Credential Lifecycle — The Complete Flow
+
+```
+Tool invoked by LLM
+  │
+  ▼
+CredentialManager.get_auth_credential()
+  │
+  ├─ 1. Is raw credential "ready"? (API key or HTTP token)
+  │     → YES: Return directly, no exchange needed
+  │
+  ├─ 2. Load from CredentialService (cached exchanged credential)
+  │     → FOUND & not expired: Return it
+  │     → FOUND & expired: Go to step 6 (refresh)
+  │
+  ├─ 3. Load from auth_response (user just completed OAuth login)
+  │     → FOUND: Go to step 5 (exchange auth_code → token)
+  │
+  ├─ 4. Is this client_credentials flow?
+  │     → YES: Use raw credential (client_id/secret) directly for exchange
+  │
+  ├─ 5. Exchange credential
+  │     │  CredentialExchangerRegistry selects the right exchanger:
+  │     │   ├─ OAUTH2 → OAuth2CredentialExchanger
+  │     │   │    └─ auth_code → access_token + refresh_token
+  │     │   ├─ OPEN_ID_CONNECT → OAuth2CredentialExchanger (same)
+  │     │   ├─ SERVICE_ACCOUNT → ServiceAccountCredentialExchanger
+  │     │   │    └─ JSON key → google.auth.credentials → access_token
+  │     │   └─ Custom exchanger (user-registered)
+  │     │
+  │     └─ Exchange result → AuthCredential with HTTP bearer token
+  │
+  ├─ 6. Refresh if expired
+  │     └─ OAuth2CredentialRefresher:
+  │          refresh_token → token_endpoint → new access_token
+  │
+  ├─ 7. Save exchanged credential
+  │     └─ credential_service.save_credential(auth_config, callback_context)
+  │
+  └─ 8. Inject into HTTP request
+        └─ credential_to_param() converts to headers/query params
+
+If no credential available and OAuth2 authorization_code flow:
+  → Generate auth_uri (authorization URL for user login)
+  → Return REQUEST_EUC function call to client
+  → Tool execution pauses — client redirects user to login
+  → User completes login, redirected back with auth_code
+  → Next invocation: _AuthLlmRequestProcessor detects response
+  → Resumes at step 3 above
+```
+
+### CredentialManager — The Orchestrator
+
+`CredentialManager` is the central class that coordinates the entire credential
+lifecycle:
+
+```python
+# src/google/adk/auth/credential_manager.py
+
+class CredentialManager:
+    def __init__(self):
+        # Pre-registers default exchangers and refreshers
+        self._exchanger_registry.register(OAUTH2, OAuth2CredentialExchanger())
+        self._exchanger_registry.register(OPEN_ID_CONNECT, OAuth2CredentialExchanger())
+        self._exchanger_registry.register(SERVICE_ACCOUNT, ServiceAccountCredentialExchanger())
+        self._refresher_registry.register(OAUTH2, OAuth2CredentialRefresher())
+        self._refresher_registry.register(OPEN_ID_CONNECT, OAuth2CredentialRefresher())
+
+    async def get_auth_credential(
+        self,
+        auth_config: AuthConfig,
+        credential_service: Optional[BaseCredentialService],
+        callback_context: CallbackContext,
+        auth_response_credential: Optional[AuthCredential],
+    ) -> Optional[AuthCredential]:
+        """Main entry point — returns a ready-to-use credential or None."""
+        # 1. Validate → 2. Load cached → 3. Exchange → 4. Refresh → 5. Save
+```
+
+### Credential Exchangers — Transforming Credentials
+
+The exchanger registry maps credential types to specific exchanger
+implementations:
+
+```python
+# src/google/adk/auth/exchanger/base_credential_exchanger.py
+
+class BaseCredentialExchanger(ABC):
+    @abstractmethod
+    async def exchange(
+        self,
+        auth_credential: AuthCredential,
+        auth_scheme: Optional[AuthScheme] = None,
+    ) -> ExchangeResult:
+        # Returns: ExchangeResult(credential, was_exchanged: bool)
+
+# Built-in exchangers:
+#
+# OAuth2CredentialExchanger:
+#   - authorization_code flow: auth_code → fetch_token() → access_token + refresh_token
+#   - client_credentials flow: client_id/secret → fetch_token() → access_token
+#   - Uses authlib.OAuth2Session internally
+#
+# ServiceAccountCredentialExchanger:
+#   - service_account_credential JSON → google.auth.Credentials → access_token
+#   - Calls credentials.refresh(google.auth.transport.requests.Request())
+#   - Returns AuthCredential(auth_type=HTTP, http=bearer_token)
+```
+
+Developers can register custom exchangers for custom auth flows:
+
+```python
+credential_manager = CredentialManager()
+credential_manager._exchanger_registry.register(
+    AuthCredentialTypes.OAUTH2,
+    MyCustomOAuth2Exchanger(),  # Extends BaseCredentialExchanger
+)
+```
+
+### OAuth2 End-to-End: Authorization Code Flow
+
+```
+Step 1: Developer provides client_id + client_secret in AuthCredential
+  auth_credential = AuthCredential(
+      auth_type=AuthCredentialTypes.OAUTH2,
+      oauth2=OAuth2Auth(
+          client_id="my-app-id",
+          client_secret="my-app-secret",
+      ),
+  )
+
+Step 2: Tool is invoked, no cached token exists
+  → AuthHandler.generate_auth_uri() called
+  → Creates authlib.OAuth2Session(client_id, client_secret)
+  → Calls session.create_authorization_url(authorization_endpoint)
+  → Returns auth_uri + state (CSRF token)
+
+Step 3: ADK returns REQUEST_EUC function call to client
+  → Client receives: AuthConfig with exchanged_auth_credential.oauth2.auth_uri
+  → Client opens browser to auth_uri
+  → User logs in, grants permissions
+  → Provider redirects to redirect_uri?code=AUTH_CODE&state=STATE
+
+Step 4: Client sends auth_code back to ADK
+  → _AuthLlmRequestProcessor detects auth response
+  → AuthHandler.parse_and_store_auth_response() stores in session state
+  → Resumes original function call
+
+Step 5: ADK exchanges auth_code → tokens
+  → OAuth2CredentialExchanger._exchange_authorization_code()
+  → authlib.OAuth2Session.fetch_token(token_endpoint, code=auth_code)
+  → Provider returns: { access_token, refresh_token, expires_at }
+  → update_credential_with_tokens() fills OAuth2Auth fields
+
+Step 6: Credential saved and injected
+  → credential_service.save_credential(auth_config, callback_context)
+  → credential_to_param() → {"Authorization": "Bearer {access_token}"}
+  → HTTP request made with bearer token
+
+Step 7: On subsequent calls, cached credential loaded
+  → credential_service.load_credential() returns saved token
+  → If expired: OAuth2CredentialRefresher refreshes via refresh_token
+  → Refreshed token saved back to credential_service
+```
+
+### OAuth2 End-to-End: Client Credentials Flow
+
+```
+Step 1: Developer provides client_id + client_secret
+  (Same AuthCredential as above)
+
+Step 2: Tool is invoked, no cached token exists
+  → OAuth2CredentialExchanger._exchange_client_credentials()
+  → authlib.OAuth2Session.fetch_token(token_endpoint, grant_type="client_credentials")
+  → Provider returns: { access_token } (no refresh_token for machine-to-machine)
+
+Step 3: Credential saved and injected
+  → Same as authorization_code steps 6-7 above
+  → No user interaction required
+```
+
+### How Auth Credentials Become HTTP Parameters
 
 ```python
 # src/google/adk/tools/openapi_tool/auth/auth_helpers.py
 
-def credential_to_param(auth_credential, auth_scheme):
-    """Convert an AuthCredential to request parameters."""
-    if auth_credential.auth_type == AuthCredentialTypes.API_KEY:
-        if auth_scheme.in_ == APIKeyIn.header:
-            return {"headers": {auth_scheme.name: auth_credential.api_key}}
-        elif auth_scheme.in_ == APIKeyIn.query:
-            return {"query_params": {auth_scheme.name: auth_credential.api_key}}
+def credential_to_param(auth_scheme, auth_credential):
+    """Convert an AuthCredential to HTTP request parameters."""
 
-    elif auth_credential.auth_type == AuthCredentialTypes.HTTP:
-        if auth_credential.http.scheme == "bearer":
-            return {"headers": {"Authorization": f"Bearer {auth_credential.http.credentials.token}"}}
-        elif auth_credential.http.scheme == "basic":
-            encoded = base64.b64encode(f"{username}:{password}".encode()).decode()
-            return {"headers": {"Authorization": f"Basic {encoded}"}}
+    # API Key → header, query param, or cookie
+    if auth_scheme.type_ == "apiKey":
+        if auth_scheme.in_ == "header":
+            → {"headers": {"X-API-Key": "my-key-value"}}
+        elif auth_scheme.in_ == "query":
+            → {"query_params": {"api_key": "my-key-value"}}
+        elif auth_scheme.in_ == "cookie":
+            → {"cookies": {"api_key": "my-key-value"}}
+
+    # HTTP Bearer → Authorization header
+    elif auth_credential.auth_type == HTTP and scheme == "bearer":
+        → {"headers": {"Authorization": "Bearer eyJhbGci..."}}
+
+    # OAuth2/OIDC (after exchange) → same as HTTP Bearer
+    elif auth_scheme.type_ in ("oauth2", "openIdConnect"):
+        if auth_credential.http and auth_credential.http.credentials.token:
+            → {"headers": {"Authorization": "Bearer eyJhbGci..."}}
+
+    # Service account → exchanged to bearer token first
+    # (ServiceAccountCredentialExchanger handles the conversion)
 ```
 
 ### MCP Tool Auth
 
-MCP tools use `BaseAuthenticatedTool` and convert credentials to HTTP headers:
+MCP tools inherit from `BaseAuthenticatedTool` and convert credentials to HTTP
+headers for the MCP session:
 
 ```python
 # src/google/adk/tools/mcp_tool/mcp_tool.py
@@ -990,20 +2039,110 @@ MCP tools use `BaseAuthenticatedTool` and convert credentials to HTTP headers:
 class McpTool(BaseAuthenticatedTool):
     def _get_headers(self, credential: AuthCredential) -> dict:
         """Convert AuthCredential to MCP session headers."""
-        if credential.auth_type == AuthCredentialTypes.OAUTH2:
+        if credential.auth_type == OAUTH2:
             return {"Authorization": f"Bearer {credential.oauth2.access_token}"}
-        elif credential.auth_type == AuthCredentialTypes.HTTP:
+        elif credential.auth_type == HTTP:
             if credential.http.scheme == "bearer":
                 return {"Authorization": f"Bearer {credential.http.credentials.token}"}
             elif credential.http.scheme == "basic":
-                encoded = base64.b64encode(...)
+                encoded = base64.b64encode(f"{user}:{pass}".encode()).decode()
                 return {"Authorization": f"Basic {encoded}"}
-        elif credential.auth_type == AuthCredentialTypes.API_KEY:
+        elif credential.auth_type == API_KEY:
             return {"x-api-key": credential.api_key}
-        elif credential.auth_type == AuthCredentialTypes.SERVICE_ACCOUNT:
+        elif credential.auth_type == SERVICE_ACCOUNT:
             token = credential.service_account.get_access_token()
             return {"Authorization": f"Bearer {token}"}
 ```
+
+### OpenAPI Tools — Declaring Auth Requirements
+
+When an OpenAPI spec defines security schemes, ADK automatically extracts them
+and wires up authentication:
+
+```python
+# OpenAPI spec → parsed by dict_to_auth_scheme()
+# src/google/adk/tools/openapi_tool/auth/auth_helpers.py
+
+# From spec:
+# securityDefinitions:
+#   api_key:
+#     type: apiKey
+#     name: X-API-Key
+#     in: header
+# → Produces: APIKey(type_="apiKey", name="X-API-Key", in_="header")
+
+# From spec:
+#   oauth2:
+#     type: oauth2
+#     flows:
+#       authorizationCode:
+#         authorizationUrl: https://accounts.google.com/o/oauth2/auth
+#         tokenUrl: https://oauth2.googleapis.com/token
+#         scopes: { "email": "..." }
+# → Produces: OAuth2(type_="oauth2", flows=OAuthFlows(...))
+
+# RestApiTool receives auth_scheme and auth_credential at construction time:
+class RestApiTool(BaseTool):
+    def __init__(self, ..., auth_scheme=None, auth_credential=None):
+        self.auth_scheme = auth_scheme
+        self.auth_credential = auth_credential
+
+    async def run(self, ...):
+        # Uses ToolAuthHandler to prepare credentials (exchange, refresh, cache)
+        auth_handler = ToolAuthHandler.from_tool_context(
+            tool_context,
+            auth_scheme=self.auth_scheme,
+            auth_credential=self.auth_credential,
+        )
+        auth_result = await auth_handler.prepare_auth_credentials()
+        # Then: credential_to_param() → inject into HTTP request
+```
+
+### Helper Functions for Quick Auth Setup
+
+```python
+# src/google/adk/tools/openapi_tool/auth/auth_helpers.py
+
+# Quick API key or bearer token setup:
+scheme, credential = token_to_scheme_credential(
+    token_type="apikey",     # or "oauth2Token"
+    location="header",       # or "query", "cookie"
+    name="X-API-Key",
+    credential_value="sk-my-key-12345",
+)
+
+# Quick service account setup:
+scheme, credential = service_account_dict_to_scheme_credential(
+    config=json.load(open("service-account.json")),
+    scopes=["https://www.googleapis.com/auth/cloud-platform"],
+)
+
+# Quick OIDC setup from discovery URL:
+scheme, credential = openid_url_to_scheme_credential(
+    openid_url="https://accounts.google.com/.well-known/openid-configuration",
+    scopes=["openid", "email"],
+    credential_dict={"client_id": "...", "client_secret": "..."},
+)
+```
+
+### Auth System Component Summary
+
+| Component | Purpose | File |
+|-----------|---------|------|
+| `AuthCredential` | Stores credential data (keys, tokens, configs) | `auth/auth_credential.py` |
+| `AuthConfig` | Links credential to scheme + provides cache key | `auth/auth_tool.py` |
+| `BaseCredentialService` | Interface for credential persistence (load/save) | `auth/credential_service/` |
+| `InMemoryCredentialService` | Dict-based storage (dev/test) | `auth/credential_service/` |
+| `SessionStateCredentialService` | Session state-backed storage | `auth/credential_service/` |
+| `CredentialManager` | Orchestrates validate → exchange → refresh → cache | `auth/credential_manager.py` |
+| `CredentialExchangerRegistry` | Maps credential types to exchangers | `auth/exchanger/` |
+| `OAuth2CredentialExchanger` | auth_code/client_credentials → access_token | `auth/exchanger/` |
+| `ServiceAccountCredentialExchanger` | SA JSON key → access_token | `tools/openapi_tool/auth/` |
+| `OAuth2CredentialRefresher` | refresh_token → new access_token | `auth/refresher/` |
+| `AuthHandler` | Generates auth_uri, parses auth response | `auth/auth_handler.py` |
+| `ToolAuthHandler` | OpenAPI tool-specific auth orchestration | `tools/openapi_tool/` |
+| `credential_to_param()` | Converts credential → HTTP headers/params | `tools/openapi_tool/auth/` |
+| `dict_to_auth_scheme()` | Parses OpenAPI security scheme → AuthScheme | `tools/openapi_tool/auth/` |
 
 ---
 
