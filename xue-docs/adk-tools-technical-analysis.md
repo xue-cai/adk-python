@@ -29,6 +29,10 @@ authentication is handled, and how the entire execution pipeline fits together.
 13. [Utility Tools](#13-utility-tools)
     - [LoadMemoryTool — Cross-Session Memory Search](#loadmemorytool--cross-session-memory-search)
 14. [Authentication System](#14-authentication-system)
+    - [Where Credentials Are Stored](#where-credentials-are-stored)
+    - [Credential Lifecycle — The Complete Flow](#credential-lifecycle--the-complete-flow)
+    - [OAuth2 End-to-End: Authorization Code Flow](#oauth2-end-to-end-authorization-code-flow)
+    - [Auth System Component Summary](#auth-system-component-summary)
 15. [Tool Execution Flow (Runner → Agent → Tool)](#15-tool-execution-flow-runner--agent--tool)
 16. [ToolContext — What Tools Receive at Runtime](#16-toolcontext--what-tools-receive-at-runtime)
 17. [Toolsets and Filtering](#17-toolsets-and-filtering)
@@ -1641,7 +1645,8 @@ class ComputerUseTool(FunctionTool):
 ## 14. Authentication System
 
 Authentication is one of the most sophisticated parts of the tools system. It
-supports multiple auth mechanisms and handles the complete credential lifecycle.
+supports multiple auth mechanisms and handles the complete credential lifecycle
+including storage, exchange, refresh, and injection into HTTP requests.
 
 ### Auth Data Models
 
@@ -1649,125 +1654,384 @@ supports multiple auth mechanisms and handles the complete credential lifecycle.
 # src/google/adk/auth/auth_credential.py
 
 class AuthCredentialTypes(str, Enum):
-    API_KEY = "apiKey"
-    HTTP = "http"
-    OAUTH2 = "oauth2"
-    OPEN_ID_CONNECT = "openIdConnect"
-    SERVICE_ACCOUNT = "serviceAccount"
+    API_KEY = "apiKey"              # Static API key
+    HTTP = "http"                   # Bearer token, Basic auth
+    OAUTH2 = "oauth2"              # OAuth2 flows
+    OPEN_ID_CONNECT = "openIdConnect"  # OIDC (extends OAuth2)
+    SERVICE_ACCOUNT = "serviceAccount"  # Google Service Account
 
 class AuthCredential(BaseModel):
     auth_type: AuthCredentialTypes
-    resource_ref: Optional[str] = None
-    api_key: Optional[str] = None
-    http: Optional[HttpAuth] = None           # Bearer tokens, Basic auth
-    service_account: Optional[ServiceAccount] = None
-    oauth2: Optional[OAuth2Auth] = None       # OAuth2 / OIDC tokens
+    resource_ref: Optional[str] = None  # Future: reference to external secret
 
-class OAuth2Auth(BaseModel):
-    client_id: Optional[str] = None
-    client_secret: Optional[str] = None
-    auth_uri: Optional[str] = None
-    auth_code: Optional[str] = None
-    access_token: Optional[str] = None
-    refresh_token: Optional[str] = None
-    expires_at: Optional[int] = None
+    # --- API Key ---
+    api_key: Optional[str] = None       # The key value itself
+
+    # --- HTTP Auth ---
+    http: Optional[HttpAuth] = None
+    # HttpAuth contains:
+    #   scheme: str                     # "bearer" or "basic"
+    #   credentials: HttpCredentials
+    #     token: Optional[str]          # Bearer token value
+    #     username: Optional[str]       # Basic auth username
+    #     password: Optional[str]       # Basic auth password
+    #   additional_headers: Optional[Dict[str, str]]
+
+    # --- Service Account ---
+    service_account: Optional[ServiceAccount] = None
+    # ServiceAccount contains:
+    #   service_account_credential: Optional[ServiceAccountCredential]
+    #     type_, project_id, private_key_id, private_key,
+    #     client_email, client_id, auth_uri, token_uri,
+    #     auth_provider_x509_cert_url, client_x509_cert_url
+    #   scopes: List[str]              # OAuth scopes to request
+    #   use_default_credential: Optional[bool]  # Use ADC instead
+
+    # --- OAuth2 / OIDC ---
+    oauth2: Optional[OAuth2Auth] = None
+    # OAuth2Auth contains:
+    #   client_id: Optional[str]       # App registration
+    #   client_secret: Optional[str]   # App secret
+    #   auth_uri: Optional[str]        # Generated authorization URL
+    #   state: Optional[str]           # CSRF protection token (auto-generated)
+    #   redirect_uri: Optional[str]    # Where to redirect after auth
+    #   auth_response_uri: Optional[str]  # Response URL with auth code
+    #   auth_code: Optional[str]       # Authorization code from redirect
+    #   access_token: Optional[str]    # The bearer token (after exchange)
+    #   refresh_token: Optional[str]   # For token renewal
+    #   expires_at: Optional[int]      # Token expiration timestamp
+    #   expires_in: Optional[int]      # Token lifetime in seconds
+    #   audience: Optional[str]        # Target audience
+    #   token_endpoint_auth_method: Optional[str]
+    #     # "client_secret_basic" | "client_secret_post" | "none"
 ```
 
-### Auth Config
+### Auth Config — Connecting Credentials to Tools
+
+`AuthConfig` links a security scheme definition to actual credentials and
+provides a stable key for credential storage:
 
 ```python
 # src/google/adk/auth/auth_tool.py
 
 class AuthConfig(BaseModel):
-    auth_scheme: AuthScheme           # Security scheme definition (OpenAPI-style)
-    raw_auth_credential: Optional[AuthCredential] = None     # Input credential
-    exchanged_auth_credential: Optional[AuthCredential] = None  # After exchange
+    auth_scheme: AuthScheme
+      # The security scheme from the OpenAPI spec (APIKey, HTTPBearer, OAuth2, etc.)
+
+    raw_auth_credential: Optional[AuthCredential] = None
+      # The credential as provided by the developer or client.
+      # For API key: directly usable (contains the key value).
+      # For OAuth2: contains client_id + client_secret (needs exchange).
+      # For service account: contains the JSON key file data.
+
+    exchanged_auth_credential: Optional[AuthCredential] = None
+      # The credential after ADK processes it:
+      # For OAuth2: auth_uri + state generated (before user login),
+      #   then access_token + refresh_token (after exchange).
+      # For service account: access_token from google.auth.
+      # For API key: same as raw_auth_credential.
+
+    credential_key: Optional[str] = None
+      # Unique storage key, auto-generated if not provided.
+      # Format: "adk_{scheme_name}_{scheme_sha256}_{cred_type}_{cred_sha256}"
+      # Stable across Python hash seeds (uses SHA256, not hash()).
 ```
 
-### The Auth Flow
+The `credential_key` is central to the caching system. It's deterministically
+derived from the auth scheme and credential content, so the same tool + same
+credential always maps to the same cache key:
 
-```
-┌─────────────┐     ┌──────────────────┐     ┌──────────────────────┐
-│ Tool invoked │────▶│ ToolAuthHandler  │────▶│ CredentialStore      │
-│              │     │                  │     │ (in ToolContext.state)│
-└─────────────┘     └──────────────────┘     └──────────────────────┘
-                           │                            │
-                    ┌──────▼──────────┐         Has cached credential?
-                    │ Check cache     │────────── Yes ──▶ Use it
-                    │                 │
-                    │ No cached cred  │
-                    └──────┬──────────┘
-                           │
-                    ┌──────▼──────────────────────────┐
-                    │ AutoAuthCredentialExchanger      │
-                    │                                  │
-                    │ Routes to specific exchanger:    │
-                    │  ├─ OAuth2CredentialExchanger    │
-                    │  ├─ ServiceAccountExchanger      │
-                    │  └─ Custom exchangers            │
-                    └──────┬──────────────────────────┘
-                           │
-                    ┌──────▼──────────┐
-                    │ Exchange result  │
-                    │                  │
-                    │ Success? ───▶ Cache & use
-                    │ Need user? ──▶ Request user auth (pause tool)
-                    └─────────────────┘
+```python
+# Auto-generation in AuthConfig.__init__()
+def get_credential_key(self) -> str:
+    scheme_digest = hashlib.sha256(
+        self.auth_scheme.model_dump_json().encode()
+    ).hexdigest()[:16]
+    cred_digest = hashlib.sha256(
+        self.raw_auth_credential.model_dump_json().encode()
+    ).hexdigest()[:16]
+    return f"adk_{scheme_name}_{scheme_digest}_{cred_type}_{cred_digest}"
 ```
 
-### ToolAuthHandler — Core Orchestrator
+### Where Credentials Are Stored
+
+ADK provides two built-in credential services plus a tool-level store:
+
+#### 1. `InMemoryCredentialService` — Development/Testing
+
+```python
+# src/google/adk/auth/credential_service/in_memory_credential_service.py
+
+class InMemoryCredentialService(BaseCredentialService):
+    # Stores in a Python dict keyed by "{app_name}/{user_id}/{credential_key}"
+    # Scoped per app and per user — no cross-user access
+    # Lost on process restart
+```
+
+#### 2. `SessionStateCredentialService` — Persistent via Session
+
+```python
+# src/google/adk/auth/credential_service/session_state_credential_service.py
+
+class SessionStateCredentialService(BaseCredentialService):
+    async def load_credential(self, auth_config, callback_context):
+        # Reads from: callback_context.state[credential_key]
+        # Persists across invocations via session state storage
+
+    async def save_credential(self, auth_config, callback_context):
+        # Writes to: callback_context.state[credential_key]
+        # WARNING: Not secure for production — tokens stored in session state
+```
+
+#### 3. `ToolContextCredentialStore` — OpenAPI Tool Cache
 
 ```python
 # src/google/adk/tools/openapi_tool/openapi_spec_parser/tool_auth_handler.py
 
-class ToolAuthHandler:
-    async def prepare_auth_credentials(self, tool_context):
-        # 1. Check credential store for cached credential
-        cached = credential_store.load(credential_key)
-        if cached and not expired:
-            return cached
-
-        # 2. Try refresh (OAuth2 / OIDC)
-        if has_refresh_token:
-            refreshed = OAuth2CredentialRefresher().refresh(credential)
-            credential_store.save(refreshed)
-            return refreshed
-
-        # 3. Try exchange via AutoAuthCredentialExchanger
-        exchanged = AutoAuthCredentialExchanger().exchange(auth_scheme, raw_credential)
-        if exchanged:
-            credential_store.save(exchanged)
-            return exchanged
-
-        # 4. Request user authorization
-        tool_context.request_credential(auth_config)
-        return None  # Tool returns "Pending User Authorization"
+# Used internally by OpenAPI tools. Stores in tool_context.state
+# with legacy key migration support for backwards compatibility.
+# Key format: "{scheme_digest}_{credential_digest}_existing_exchanged_credential"
 ```
 
-### How Auth Credentials Become HTTP Params
+**The `BaseCredentialService` interface** that all implementations follow:
+
+```python
+# src/google/adk/auth/credential_service/base_credential_service.py
+
+class BaseCredentialService(ABC):
+    @abstractmethod
+    async def load_credential(
+        self,
+        auth_config: AuthConfig,       # Contains credential_key for lookup
+        callback_context: CallbackContext,  # Provides app_name, user_id, state
+    ) -> Optional[AuthCredential]:
+
+    @abstractmethod
+    async def save_credential(
+        self,
+        auth_config: AuthConfig,       # Contains exchanged_auth_credential
+        callback_context: CallbackContext,
+    ) -> None:
+```
+
+Developers can implement custom backends (e.g., Google Secret Manager,
+HashiCorp Vault, database-backed) by extending `BaseCredentialService`.
+
+### Credential Lifecycle — The Complete Flow
+
+```
+Tool invoked by LLM
+  │
+  ▼
+CredentialManager.get_auth_credential()
+  │
+  ├─ 1. Is raw credential "ready"? (API key or HTTP token)
+  │     → YES: Return directly, no exchange needed
+  │
+  ├─ 2. Load from CredentialService (cached exchanged credential)
+  │     → FOUND & not expired: Return it
+  │     → FOUND & expired: Go to step 6 (refresh)
+  │
+  ├─ 3. Load from auth_response (user just completed OAuth login)
+  │     → FOUND: Go to step 5 (exchange auth_code → token)
+  │
+  ├─ 4. Is this client_credentials flow?
+  │     → YES: Use raw credential (client_id/secret) directly for exchange
+  │
+  ├─ 5. Exchange credential
+  │     │  CredentialExchangerRegistry selects the right exchanger:
+  │     │   ├─ OAUTH2 → OAuth2CredentialExchanger
+  │     │   │    └─ auth_code → access_token + refresh_token
+  │     │   ├─ OPEN_ID_CONNECT → OAuth2CredentialExchanger (same)
+  │     │   ├─ SERVICE_ACCOUNT → ServiceAccountCredentialExchanger
+  │     │   │    └─ JSON key → google.auth.credentials → access_token
+  │     │   └─ Custom exchanger (user-registered)
+  │     │
+  │     └─ Exchange result → AuthCredential with HTTP bearer token
+  │
+  ├─ 6. Refresh if expired
+  │     └─ OAuth2CredentialRefresher:
+  │          refresh_token → token_endpoint → new access_token
+  │
+  ├─ 7. Save exchanged credential
+  │     └─ credential_service.save_credential(auth_config, callback_context)
+  │
+  └─ 8. Inject into HTTP request
+        └─ credential_to_param() converts to headers/query params
+
+If no credential available and OAuth2 authorization_code flow:
+  → Generate auth_uri (authorization URL for user login)
+  → Return REQUEST_EUC function call to client
+  → Tool execution pauses — client redirects user to login
+  → User completes login, redirected back with auth_code
+  → Next invocation: _AuthLlmRequestProcessor detects response
+  → Resumes at step 3 above
+```
+
+### CredentialManager — The Orchestrator
+
+`CredentialManager` is the central class that coordinates the entire credential
+lifecycle:
+
+```python
+# src/google/adk/auth/credential_manager.py
+
+class CredentialManager:
+    def __init__(self):
+        # Pre-registers default exchangers and refreshers
+        self._exchanger_registry.register(OAUTH2, OAuth2CredentialExchanger())
+        self._exchanger_registry.register(OPEN_ID_CONNECT, OAuth2CredentialExchanger())
+        self._exchanger_registry.register(SERVICE_ACCOUNT, ServiceAccountCredentialExchanger())
+        self._refresher_registry.register(OAUTH2, OAuth2CredentialRefresher())
+        self._refresher_registry.register(OPEN_ID_CONNECT, OAuth2CredentialRefresher())
+
+    async def get_auth_credential(
+        self,
+        auth_config: AuthConfig,
+        credential_service: Optional[BaseCredentialService],
+        callback_context: CallbackContext,
+        auth_response_credential: Optional[AuthCredential],
+    ) -> Optional[AuthCredential]:
+        """Main entry point — returns a ready-to-use credential or None."""
+        # 1. Validate → 2. Load cached → 3. Exchange → 4. Refresh → 5. Save
+```
+
+### Credential Exchangers — Transforming Credentials
+
+The exchanger registry maps credential types to specific exchanger
+implementations:
+
+```python
+# src/google/adk/auth/exchanger/base_credential_exchanger.py
+
+class BaseCredentialExchanger(ABC):
+    @abstractmethod
+    async def exchange(
+        self,
+        auth_credential: AuthCredential,
+        auth_scheme: Optional[AuthScheme] = None,
+    ) -> ExchangeResult:
+        # Returns: ExchangeResult(credential, was_exchanged: bool)
+
+# Built-in exchangers:
+#
+# OAuth2CredentialExchanger:
+#   - authorization_code flow: auth_code → fetch_token() → access_token + refresh_token
+#   - client_credentials flow: client_id/secret → fetch_token() → access_token
+#   - Uses authlib.OAuth2Session internally
+#
+# ServiceAccountCredentialExchanger:
+#   - service_account_credential JSON → google.auth.Credentials → access_token
+#   - Calls credentials.refresh(google.auth.transport.requests.Request())
+#   - Returns AuthCredential(auth_type=HTTP, http=bearer_token)
+```
+
+Developers can register custom exchangers for custom auth flows:
+
+```python
+credential_manager = CredentialManager()
+credential_manager._exchanger_registry.register(
+    AuthCredentialTypes.OAUTH2,
+    MyCustomOAuth2Exchanger(),  # Extends BaseCredentialExchanger
+)
+```
+
+### OAuth2 End-to-End: Authorization Code Flow
+
+```
+Step 1: Developer provides client_id + client_secret in AuthCredential
+  auth_credential = AuthCredential(
+      auth_type=AuthCredentialTypes.OAUTH2,
+      oauth2=OAuth2Auth(
+          client_id="my-app-id",
+          client_secret="my-app-secret",
+      ),
+  )
+
+Step 2: Tool is invoked, no cached token exists
+  → AuthHandler.generate_auth_uri() called
+  → Creates authlib.OAuth2Session(client_id, client_secret)
+  → Calls session.create_authorization_url(authorization_endpoint)
+  → Returns auth_uri + state (CSRF token)
+
+Step 3: ADK returns REQUEST_EUC function call to client
+  → Client receives: AuthConfig with exchanged_auth_credential.oauth2.auth_uri
+  → Client opens browser to auth_uri
+  → User logs in, grants permissions
+  → Provider redirects to redirect_uri?code=AUTH_CODE&state=STATE
+
+Step 4: Client sends auth_code back to ADK
+  → _AuthLlmRequestProcessor detects auth response
+  → AuthHandler.parse_and_store_auth_response() stores in session state
+  → Resumes original function call
+
+Step 5: ADK exchanges auth_code → tokens
+  → OAuth2CredentialExchanger._exchange_authorization_code()
+  → authlib.OAuth2Session.fetch_token(token_endpoint, code=auth_code)
+  → Provider returns: { access_token, refresh_token, expires_at }
+  → update_credential_with_tokens() fills OAuth2Auth fields
+
+Step 6: Credential saved and injected
+  → credential_service.save_credential(auth_config, callback_context)
+  → credential_to_param() → {"Authorization": "Bearer {access_token}"}
+  → HTTP request made with bearer token
+
+Step 7: On subsequent calls, cached credential loaded
+  → credential_service.load_credential() returns saved token
+  → If expired: OAuth2CredentialRefresher refreshes via refresh_token
+  → Refreshed token saved back to credential_service
+```
+
+### OAuth2 End-to-End: Client Credentials Flow
+
+```
+Step 1: Developer provides client_id + client_secret
+  (Same AuthCredential as above)
+
+Step 2: Tool is invoked, no cached token exists
+  → OAuth2CredentialExchanger._exchange_client_credentials()
+  → authlib.OAuth2Session.fetch_token(token_endpoint, grant_type="client_credentials")
+  → Provider returns: { access_token } (no refresh_token for machine-to-machine)
+
+Step 3: Credential saved and injected
+  → Same as authorization_code steps 6-7 above
+  → No user interaction required
+```
+
+### How Auth Credentials Become HTTP Parameters
 
 ```python
 # src/google/adk/tools/openapi_tool/auth/auth_helpers.py
 
-def credential_to_param(auth_credential, auth_scheme):
-    """Convert an AuthCredential to request parameters."""
-    if auth_credential.auth_type == AuthCredentialTypes.API_KEY:
-        if auth_scheme.in_ == APIKeyIn.header:
-            return {"headers": {auth_scheme.name: auth_credential.api_key}}
-        elif auth_scheme.in_ == APIKeyIn.query:
-            return {"query_params": {auth_scheme.name: auth_credential.api_key}}
+def credential_to_param(auth_scheme, auth_credential):
+    """Convert an AuthCredential to HTTP request parameters."""
 
-    elif auth_credential.auth_type == AuthCredentialTypes.HTTP:
-        if auth_credential.http.scheme == "bearer":
-            return {"headers": {"Authorization": f"Bearer {auth_credential.http.credentials.token}"}}
-        elif auth_credential.http.scheme == "basic":
-            encoded = base64.b64encode(f"{username}:{password}".encode()).decode()
-            return {"headers": {"Authorization": f"Basic {encoded}"}}
+    # API Key → header, query param, or cookie
+    if auth_scheme.type_ == "apiKey":
+        if auth_scheme.in_ == "header":
+            → {"headers": {"X-API-Key": "my-key-value"}}
+        elif auth_scheme.in_ == "query":
+            → {"query_params": {"api_key": "my-key-value"}}
+        elif auth_scheme.in_ == "cookie":
+            → {"cookies": {"api_key": "my-key-value"}}
+
+    # HTTP Bearer → Authorization header
+    elif auth_credential.auth_type == HTTP and scheme == "bearer":
+        → {"headers": {"Authorization": "Bearer eyJhbGci..."}}
+
+    # OAuth2/OIDC (after exchange) → same as HTTP Bearer
+    elif auth_scheme.type_ in ("oauth2", "openIdConnect"):
+        if auth_credential.http and auth_credential.http.credentials.token:
+            → {"headers": {"Authorization": "Bearer eyJhbGci..."}}
+
+    # Service account → exchanged to bearer token first
+    # (ServiceAccountCredentialExchanger handles the conversion)
 ```
 
 ### MCP Tool Auth
 
-MCP tools use `BaseAuthenticatedTool` and convert credentials to HTTP headers:
+MCP tools inherit from `BaseAuthenticatedTool` and convert credentials to HTTP
+headers for the MCP session:
 
 ```python
 # src/google/adk/tools/mcp_tool/mcp_tool.py
@@ -1775,20 +2039,110 @@ MCP tools use `BaseAuthenticatedTool` and convert credentials to HTTP headers:
 class McpTool(BaseAuthenticatedTool):
     def _get_headers(self, credential: AuthCredential) -> dict:
         """Convert AuthCredential to MCP session headers."""
-        if credential.auth_type == AuthCredentialTypes.OAUTH2:
+        if credential.auth_type == OAUTH2:
             return {"Authorization": f"Bearer {credential.oauth2.access_token}"}
-        elif credential.auth_type == AuthCredentialTypes.HTTP:
+        elif credential.auth_type == HTTP:
             if credential.http.scheme == "bearer":
                 return {"Authorization": f"Bearer {credential.http.credentials.token}"}
             elif credential.http.scheme == "basic":
-                encoded = base64.b64encode(...)
+                encoded = base64.b64encode(f"{user}:{pass}".encode()).decode()
                 return {"Authorization": f"Basic {encoded}"}
-        elif credential.auth_type == AuthCredentialTypes.API_KEY:
+        elif credential.auth_type == API_KEY:
             return {"x-api-key": credential.api_key}
-        elif credential.auth_type == AuthCredentialTypes.SERVICE_ACCOUNT:
+        elif credential.auth_type == SERVICE_ACCOUNT:
             token = credential.service_account.get_access_token()
             return {"Authorization": f"Bearer {token}"}
 ```
+
+### OpenAPI Tools — Declaring Auth Requirements
+
+When an OpenAPI spec defines security schemes, ADK automatically extracts them
+and wires up authentication:
+
+```python
+# OpenAPI spec → parsed by dict_to_auth_scheme()
+# src/google/adk/tools/openapi_tool/auth/auth_helpers.py
+
+# From spec:
+# securityDefinitions:
+#   api_key:
+#     type: apiKey
+#     name: X-API-Key
+#     in: header
+# → Produces: APIKey(type_="apiKey", name="X-API-Key", in_="header")
+
+# From spec:
+#   oauth2:
+#     type: oauth2
+#     flows:
+#       authorizationCode:
+#         authorizationUrl: https://accounts.google.com/o/oauth2/auth
+#         tokenUrl: https://oauth2.googleapis.com/token
+#         scopes: { "email": "..." }
+# → Produces: OAuth2(type_="oauth2", flows=OAuthFlows(...))
+
+# RestApiTool receives auth_scheme and auth_credential at construction time:
+class RestApiTool(BaseTool):
+    def __init__(self, ..., auth_scheme=None, auth_credential=None):
+        self.auth_scheme = auth_scheme
+        self.auth_credential = auth_credential
+
+    async def run(self, ...):
+        # Uses ToolAuthHandler to prepare credentials (exchange, refresh, cache)
+        auth_handler = ToolAuthHandler.from_tool_context(
+            tool_context,
+            auth_scheme=self.auth_scheme,
+            auth_credential=self.auth_credential,
+        )
+        auth_result = await auth_handler.prepare_auth_credentials()
+        # Then: credential_to_param() → inject into HTTP request
+```
+
+### Helper Functions for Quick Auth Setup
+
+```python
+# src/google/adk/tools/openapi_tool/auth/auth_helpers.py
+
+# Quick API key or bearer token setup:
+scheme, credential = token_to_scheme_credential(
+    token_type="apikey",     # or "oauth2Token"
+    location="header",       # or "query", "cookie"
+    name="X-API-Key",
+    credential_value="sk-my-key-12345",
+)
+
+# Quick service account setup:
+scheme, credential = service_account_dict_to_scheme_credential(
+    config=json.load(open("service-account.json")),
+    scopes=["https://www.googleapis.com/auth/cloud-platform"],
+)
+
+# Quick OIDC setup from discovery URL:
+scheme, credential = openid_url_to_scheme_credential(
+    openid_url="https://accounts.google.com/.well-known/openid-configuration",
+    scopes=["openid", "email"],
+    credential_dict={"client_id": "...", "client_secret": "..."},
+)
+```
+
+### Auth System Component Summary
+
+| Component | Purpose | File |
+|-----------|---------|------|
+| `AuthCredential` | Stores credential data (keys, tokens, configs) | `auth/auth_credential.py` |
+| `AuthConfig` | Links credential to scheme + provides cache key | `auth/auth_tool.py` |
+| `BaseCredentialService` | Interface for credential persistence (load/save) | `auth/credential_service/` |
+| `InMemoryCredentialService` | Dict-based storage (dev/test) | `auth/credential_service/` |
+| `SessionStateCredentialService` | Session state-backed storage | `auth/credential_service/` |
+| `CredentialManager` | Orchestrates validate → exchange → refresh → cache | `auth/credential_manager.py` |
+| `CredentialExchangerRegistry` | Maps credential types to exchangers | `auth/exchanger/` |
+| `OAuth2CredentialExchanger` | auth_code/client_credentials → access_token | `auth/exchanger/` |
+| `ServiceAccountCredentialExchanger` | SA JSON key → access_token | `tools/openapi_tool/auth/` |
+| `OAuth2CredentialRefresher` | refresh_token → new access_token | `auth/refresher/` |
+| `AuthHandler` | Generates auth_uri, parses auth response | `auth/auth_handler.py` |
+| `ToolAuthHandler` | OpenAPI tool-specific auth orchestration | `tools/openapi_tool/` |
+| `credential_to_param()` | Converts credential → HTTP headers/params | `tools/openapi_tool/auth/` |
+| `dict_to_auth_scheme()` | Parses OpenAPI security scheme → AuthScheme | `tools/openapi_tool/auth/` |
 
 ---
 
